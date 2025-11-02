@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build release
+      run: cargo build --release --verbose
+
+    - name: Run tests before release
+      run: cargo test --release --verbose
+
+    - name: Get version from tag
+      id: tag_name
+      run: |
+        $VERSION = "${{ github.ref }}".Replace("refs/tags/", "")
+        echo "VERSION=$VERSION" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: target/release/my_vault.exe
+        draft: false
+        prerelease: false
+        body: |
+          # MyVault ${{ steps.tag_name.outputs.VERSION }}
+
+          ## Features
+          - ChaCha20-Poly1305 AEAD encryption
+          - Batch operations (99+ files tested)
+          - Custom lock icon
+          - Multi-select with shift+click
+          - Real-time execution timing
+
+          ## Download
+          Download `my_vault.exe` above and run directly.
+
+          See [QUICKSTART.md](https://github.com/rutthawitc/myVault_app/blob/main/docs/QUICKSTART.md) for setup instructions.
+
+          ## Changes
+          See [CHANGELOG.md](https://github.com/rutthawitc/myVault_app/blob/main/CHANGELOG.md) for full details.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
