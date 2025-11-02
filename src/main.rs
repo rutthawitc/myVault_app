@@ -105,6 +105,10 @@ struct MyVaultApp {
     show_error_report: bool,
     last_error_report: Vec<(PathBuf, String)>,
     perf_config: PerformanceConfig,  // Dynamic performance configuration based on CPU cores
+    show_change_password_dialog: bool,
+    current_password: String,
+    new_password: String,
+    new_password_confirm: String,
 }
 
 impl MyVaultApp {
@@ -127,6 +131,10 @@ impl MyVaultApp {
             show_error_report: false,
             last_error_report: Vec::new(),
             perf_config: PerformanceConfig::auto_detect(),  // Auto-detect optimal thread count
+            show_change_password_dialog: false,
+            current_password: String::new(),
+            new_password: String::new(),
+            new_password_confirm: String::new(),
         };
         app.load_from_config();
         app
@@ -658,6 +666,12 @@ impl eframe::App for MyVaultApp {
                 if ui.button(mp_label).clicked() {
                     self.show_password_dialog = true;
                 }
+                // Add Change Password button (only show if password is already set and authenticated)
+                if self.master_password_hash.is_some() && self.authenticated {
+                    if ui.button("Change Password").clicked() {
+                        self.show_change_password_dialog = true;
+                    }
+                }
             });
         });
 
@@ -898,14 +912,114 @@ impl eframe::App for MyVaultApp {
                 });
         }
 
+        // Change password dialog (only show when authenticated)
+        if self.show_change_password_dialog && self.authenticated {
+            egui::Window::new("Change Master Password")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Current password:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.current_password)
+                            .password(true)
+                            .hint_text("Current password"),
+                    );
+
+                    ui.separator();
+
+                    ui.label("New password:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_password)
+                            .password(true)
+                            .hint_text("New password"),
+                    );
+
+                    ui.label("Confirm new password:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_password_confirm)
+                            .password(true)
+                            .hint_text("Confirm new password"),
+                    );
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.show_change_password_dialog = false;
+                            self.current_password.zeroize();
+                            self.current_password.clear();
+                            self.new_password.zeroize();
+                            self.new_password.clear();
+                            self.new_password_confirm.zeroize();
+                            self.new_password_confirm.clear();
+                        }
+
+                        if ui.button("Change Password").clicked() {
+                            // Verify current password
+                            if let Some(hash) = &self.master_password_hash {
+                                match crypto::verify_password(&self.current_password, hash) {
+                                    Ok(true) => {
+                                        // Validate new password
+                                        if self.new_password.is_empty() {
+                                            self.status_message = "New password cannot be empty".to_string();
+                                        } else if self.new_password != self.new_password_confirm {
+                                            self.status_message = "New passwords do not match".to_string();
+                                        } else {
+                                            // Hash the new password
+                                            match crypto::hash_password(&self.new_password) {
+                                                Ok((new_hash, new_salt)) => {
+                                                    // Update the stored hash and salt
+                                                    self.master_password_hash = Some(new_hash);
+                                                    self.salt = Some(new_salt.clone());
+
+                                                    // Re-derive the encryption key with the new password and salt
+                                                    match crypto::derive_key(&self.new_password, &new_salt) {
+                                                        Ok(new_key) => {
+                                                            self.encryption_key = Some(new_key);
+                                                            self.save_config();
+                                                            self.status_message = "Master password changed successfully".to_string();
+                                                            self.show_change_password_dialog = false;
+                                                        }
+                                                        Err(e) => {
+                                                            self.status_message = format!("Key derivation error: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    self.status_message = format!("Hashing error: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        self.status_message = "Current password is incorrect".to_string();
+                                    }
+                                    Err(e) => {
+                                        self.status_message = format!("Password verification error: {}", e);
+                                    }
+                                }
+                            }
+
+                            // Clear password fields
+                            self.current_password.zeroize();
+                            self.current_password.clear();
+                            self.new_password.zeroize();
+                            self.new_password.clear();
+                            self.new_password_confirm.zeroize();
+                            self.new_password_confirm.clear();
+                        }
+                    });
+                });
+        }
+
         // Confirmation dialog for lock/unlock/remove/overwrite
-        if !self.show_password_dialog {
+        if !self.show_password_dialog && !self.show_change_password_dialog {
             if let Some(action) = self.confirm_action.clone() {
                 let title = match action {
                     ConfirmAction::Lock => "Confirm Lock",
                     ConfirmAction::Unlock => "Confirm Unlock",
                     ConfirmAction::Remove => "Confirm Remove",
                     ConfirmAction::OverwriteLock { .. } | ConfirmAction::OverwriteUnlock { .. } => "Confirm Overwrite",
+                    ConfirmAction::ChangePassword => "Confirm Change Password",
                 };
                 egui::Window::new(title)
                     .collapsible(false)
@@ -925,6 +1039,7 @@ impl eframe::App for MyVaultApp {
                             ConfirmAction::Remove => ui.label("This removes the item from the list only; it does not delete files."),
                             ConfirmAction::OverwriteLock { ref dst, .. } => ui.label(format!("Encrypted file exists: {}\nOverwrite?", dst.display())),
                             ConfirmAction::OverwriteUnlock { ref dst, .. } => ui.label(format!("Original file exists: {}\nOverwrite?", dst.display())),
+                            ConfirmAction::ChangePassword => ui.label("This will update your master password."),
                         };
                         ui.label(format!("Item: {}",
                             item_desc
@@ -939,6 +1054,7 @@ impl eframe::App for MyVaultApp {
                                 ConfirmAction::Remove => "Remove",
                                 ConfirmAction::OverwriteLock { .. } => "Overwrite",
                                 ConfirmAction::OverwriteUnlock { .. } => "Overwrite",
+                                ConfirmAction::ChangePassword => "Change",
                             };
                             if ui.button(confirm_label).clicked() {
                                 match action {
@@ -954,6 +1070,9 @@ impl eframe::App for MyVaultApp {
                                         if let Err(e) = self.perform_overwrite_unlock(&src, &dst) {
                                             self.status_message = format!("Overwrite failed: {}", e);
                                         }
+                                    }
+                                    ConfirmAction::ChangePassword => {
+                                        // This action is handled directly in the change password dialog
                                     }
                                 }
                                 self.confirm_action = None;
@@ -1082,4 +1201,5 @@ enum ConfirmAction {
     Remove,
     OverwriteLock { src: PathBuf, dst: PathBuf },
     OverwriteUnlock { src: PathBuf, dst: PathBuf },
+    ChangePassword,
 }
