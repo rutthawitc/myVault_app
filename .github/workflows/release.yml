@@ -9,10 +9,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  build-and-release:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -23,34 +25,41 @@ jobs:
     - name: Run tests before release
       run: cargo test --release --verbose
 
-    - name: Get version from tag
-      id: tag_name
-      run: |
-        $VERSION = "${{ github.ref }}".Replace("refs/tags/", "")
-        echo "VERSION=$VERSION" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
+    - name: Create GitHub Release
+      uses: ncipollo/release-action@v1
       with:
-        files: target/release/my_vault.exe
+        artifacts: "target/release/my_vault.exe"
         draft: false
         prerelease: false
+        generateReleaseNotes: false
         body: |
-          # MyVault ${{ steps.tag_name.outputs.VERSION }}
+          # MyVault Release
 
           ## Features
-          - ChaCha20-Poly1305 AEAD encryption
-          - Batch operations (99+ files tested)
-          - Custom lock icon
-          - Multi-select with shift+click
-          - Real-time execution timing
+          - ✅ ChaCha20-Poly1305 AEAD encryption (military-grade)
+          - ✅ Batch operations (99+ files, 14GB+ tested)
+          - ✅ Custom lock icon
+          - ✅ Multi-select with shift+click
+          - ✅ Real-time execution timing
 
-          ## Download
-          Download `my_vault.exe` above and run directly.
+          ## Installation
 
-          See [QUICKSTART.md](https://github.com/rutthawitc/myVault_app/blob/main/docs/QUICKSTART.md) for setup instructions.
+          Download `my_vault.exe` and run it directly. No installation required!
 
-          ## Changes
-          See [CHANGELOG.md](https://github.com/rutthawitc/myVault_app/blob/main/CHANGELOG.md) for full details.
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          See [QUICKSTART.md](https://github.com/rutthawitc/myVault_app/blob/main/docs/QUICKSTART.md) for detailed setup.
+
+          ## Security
+          - Military-grade encryption: ChaCha20-Poly1305
+          - Brute-force resistant: Argon2id hashing
+          - Memory-safe: Written in Rust
+          - Open source: Fully auditable
+
+          ## Performance
+          - Tested with 99 files (14GB total)
+          - Constant memory usage
+          - ~2 minutes for 14GB of files
+
+          ## Documentation
+          - [Quick Start](https://github.com/rutthawitc/myVault_app/blob/main/docs/QUICKSTART.md)
+          - [Deployment Guide](https://github.com/rutthawitc/myVault_app/blob/main/docs/DEPLOYMENT_GUIDE.md)
+          - [Full Changelog](https://github.com/rutthawitc/myVault_app/blob/main/CHANGELOG.md)
