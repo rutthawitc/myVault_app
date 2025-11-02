@@ -1,0 +1,43 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# MyVault specific
+vault_config.json
+*.vault
+*.vault_backup
+vault_config_backup.json
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.log
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Backups
+*.backup
+*.bak
+*~

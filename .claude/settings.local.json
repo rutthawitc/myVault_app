@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "Bash(timeout 180 cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nInitial commit: MyVault v1.0\n\nSecure file encryption made simple:\n- ChaCha20-Poly1305 AEAD encryption (military-grade)\n- Batch operations support (99+ files, 14GB+ tested)\n- Custom UI with lock icon\n- Streaming mode for memory efficiency\n- Multi-select with shift+click range selection\n- Real-time execution timing display\n- Cross-platform ready (Windows/macOS/Linux)\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
