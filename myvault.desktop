@@ -1,0 +1,22 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MyVault
+Comment=Secure file encryption made simple - Military-grade encryption for your sensitive files
+Exec=myvault %F
+Icon=myvault
+Terminal=false
+Categories=Utility;Security;Encryption;
+StartupNotify=true
+MimeType=application/octet-stream;
+X-AppImage-Version=1.0.0
+X-AppImage-BuildId=1
+Keywords=encryption;security;files;protect;
+
+# Additional metadata
+X-GNOME-Usable-Sidebar-Categories=false
+X-KDE-SubstituteUID=false
+
+# Features
+X-MyVault-Features=batch-encryption;stream-processing;memory-efficient;
+

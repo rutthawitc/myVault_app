@@ -1,4 +1,4 @@
-name: Release
+name: Release (Multi-Platform)
 
 on:
   push:
@@ -10,9 +10,24 @@ env:
 
 jobs:
   build-and-release:
-    runs-on: windows-latest
+    name: Build and Release on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: my_vault.exe
+            artifact_path: target/release/my_vault.exe
+          - os: macos-latest
+            artifact_name: my_vault-macos
+            artifact_path: target/release/my_vault
+          - os: ubuntu-latest
+            artifact_name: my_vault-linux
+            artifact_path: target/release/my_vault
+
     steps:
     - uses: actions/checkout@v4
 
@@ -25,15 +40,28 @@ jobs:
     - name: Run tests before release
       run: cargo test --release --verbose
 
-    - name: Create GitHub Release
+    - name: Prepare artifact
+      shell: bash
+      run: |
+        mkdir -p release-artifacts
+        cp ${{ matrix.artifact_path }} release-artifacts/${{ matrix.artifact_name }}
+        chmod +x release-artifacts/${{ matrix.artifact_name }}
+
+    - name: Create GitHub Release (Windows only)
+      if: matrix.os == 'windows-latest'
       uses: ncipollo/release-action@v1
       with:
-        artifacts: "target/release/my_vault.exe"
+        artifacts: "release-artifacts/*"
         draft: false
         prerelease: false
         generateReleaseNotes: false
         body: |
           # MyVault Release
+
+          ## Available Downloads
+          - **Windows**: `my_vault.exe` - Run directly, no installation needed
+          - **macOS**: `my_vault-macos` - Intel and Apple Silicon support
+          - **Linux**: `my_vault-linux` - Portable executable
 
           ## Features
           - ✅ ChaCha20-Poly1305 AEAD encryption (military-grade)
@@ -41,10 +69,26 @@ jobs:
           - ✅ Custom lock icon
           - ✅ Multi-select with shift+click
           - ✅ Real-time execution timing
+          - ✅ Cross-platform support (Windows, macOS, Linux)
 
           ## Installation
 
+          ### Windows
           Download `my_vault.exe` and run it directly. No installation required!
+
+          ### macOS
+          Download `my_vault-macos`, make it executable, and run:
+          ```bash
+          chmod +x my_vault-macos
+          ./my_vault-macos
+          ```
+
+          ### Linux
+          Download `my_vault-linux`, make it executable, and run:
+          ```bash
+          chmod +x my_vault-linux
+          ./my_vault-linux
+          ```
 
           See [QUICKSTART.md](https://github.com/rutthawitc/myVault_app/blob/main/docs/QUICKSTART.md) for detailed setup.
 
@@ -63,3 +107,11 @@ jobs:
           - [Quick Start](https://github.com/rutthawitc/myVault_app/blob/main/docs/QUICKSTART.md)
           - [Deployment Guide](https://github.com/rutthawitc/myVault_app/blob/main/docs/DEPLOYMENT_GUIDE.md)
           - [Full Changelog](https://github.com/rutthawitc/myVault_app/blob/main/CHANGELOG.md)
+
+    - name: Upload to release (macOS and Linux)
+      if: matrix.os != 'windows-latest'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release-artifacts/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

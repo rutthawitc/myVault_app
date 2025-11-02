@@ -1,4 +1,4 @@
-name: Build & Test
+name: Build & Test (Multi-Platform)
 
 on:
   push:
@@ -12,18 +12,27 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        rust: [stable]
+        include:
+          - os: windows-latest
+            artifact_name: my_vault.exe
+            artifact_path: target/release/my_vault.exe
+          - os: macos-latest
+            artifact_name: my_vault
+            artifact_path: target/release/my_vault
+          - os: ubuntu-latest
+            artifact_name: my_vault
+            artifact_path: target/release/my_vault
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: ${{ matrix.rust }}
 
     - name: Cache cargo registry
       uses: actions/cache@v3
@@ -59,5 +68,5 @@ jobs:
       uses: actions/upload-artifact@v3
       if: success()
       with:
-        name: my_vault-windows
-        path: target/release/my_vault.exe
+        name: my_vault-${{ runner.os }}
+        path: ${{ matrix.artifact_path }}

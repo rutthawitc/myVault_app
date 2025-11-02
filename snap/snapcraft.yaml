@@ -1,0 +1,40 @@
+name: myvault
+version: '1.0.0'
+summary: Secure file encryption made simple
+description: |
+  MyVault is a lightweight, cross-platform file encryption tool with military-grade
+  security. Encrypt and decrypt sensitive files with a master password.
+
+  Features:
+  - ChaCha20-Poly1305 AEAD encryption (military-grade)
+  - Batch operations (99+ files, 14GB+ tested)
+  - Constant memory usage (streaming mode)
+  - Real-time execution timing
+  - Multi-select support (shift+click)
+  - No dependencies or installation required
+
+grade: stable
+confinement: strict
+base: core20
+architectures: [amd64, arm64]
+
+apps:
+  myvault:
+    command: bin/my_vault
+    plugs:
+      - home
+      - removable-media
+    desktop: usr/share/applications/myvault.desktop
+
+parts:
+  myvault:
+    plugin: rust
+    source: .
+    build-packages:
+      - build-essential
+      - rustc
+      - cargo
+    stage-packages:
+      - libxcb-render0
+      - libxcb-shape0
+      - libxcb-xfixes0

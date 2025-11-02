@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "windows")]
 pub fn hide(path: &Path) -> io::Result<()> {
@@ -66,4 +66,104 @@ pub fn hide(_path: &Path) -> io::Result<()> { Ok(()) }
 
 #[cfg(not(target_os = "windows"))]
 pub fn unhide(_path: &Path) -> io::Result<()> { Ok(()) }
+
+/// Get the platform identifier
+#[cfg(target_os = "windows")]
+pub fn platform() -> &'static str {
+    "windows"
+}
+
+#[cfg(target_os = "macos")]
+pub fn platform() -> &'static str {
+    "macos"
+}
+
+#[cfg(target_os = "linux")]
+pub fn platform() -> &'static str {
+    "linux"
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+pub fn platform() -> &'static str {
+    "unknown"
+}
+
+/// Get the configuration directory path
+/// Windows: C:\Users\<User>\AppData\Local\MyVault\
+/// macOS: ~/Library/Application Support/MyVault/
+/// Linux: ~/.local/share/myvault/
+pub fn config_dir() -> io::Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs::config_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine config directory"))
+            .map(|p| p.join("MyVault"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        dirs::data_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine config directory"))
+            .map(|p| p.join("MyVault"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        dirs::data_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine config directory"))
+            .map(|p| p.join("myvault"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        // Fallback: use current directory
+        std::env::current_dir()
+    }
+}
+
+/// Get the cache directory path
+pub fn cache_dir() -> io::Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs::cache_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine cache directory"))
+            .map(|p| p.join("MyVault"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        dirs::cache_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine cache directory"))
+            .map(|p| p.join("MyVault"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        dirs::cache_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine cache directory"))
+            .map(|p| p.join("myvault"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        // Fallback: use temp directory
+        Ok(std::env::temp_dir()
+            .join("myvault"))
+    }
+}
+
+/// Check if running on Windows
+pub fn is_windows() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Check if running on macOS
+pub fn is_macos() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Check if running on Linux
+pub fn is_linux() -> bool {
+    cfg!(target_os = "linux")
+}
 

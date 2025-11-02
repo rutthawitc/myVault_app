@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ItemType, VaultItem};
+use crate::platform;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -47,28 +48,34 @@ impl From<&ConfigItem> for VaultItem {
 }
 
 pub fn config_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var_os("APPDATA").unwrap_or_else(|| "".into());
-        let mut p = PathBuf::from(base);
-        p.push("MyVault");
-        p
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let p = if home.ends_with(".config") {
-            home
-        } else {
-            let mut h = home;
-            h.push(".config");
-            h
-        };
-        p.join("myvault")
-    }
+    // Use the cross-platform platform module
+    // Falls back to old behavior if platform::config_dir() fails
+    platform::config_dir()
+        .unwrap_or_else(|_| {
+            // Fallback to previous behavior
+            #[cfg(target_os = "windows")]
+            {
+                let base = std::env::var_os("APPDATA").unwrap_or_else(|| "".into());
+                let mut p = PathBuf::from(base);
+                p.push("MyVault");
+                p
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let home = std::env::var_os("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let p = if home.ends_with(".config") {
+                    home
+                } else {
+                    let mut h = home;
+                    h.push(".config");
+                    h
+                };
+                p.join("myvault")
+            }
+        })
 }
 
 pub fn config_path() -> PathBuf {

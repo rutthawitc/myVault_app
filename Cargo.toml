@@ -1,6 +1,6 @@
 [package]
 name = "my_vault"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -21,6 +21,9 @@ winapi = { version = "0.3", features = ["winnt", "fileapi", "winbase"], optional
 num_cpus = "1.16"
 rayon = "1.8"
 memmap2 = "0.9"
+
+# Cross-platform support
+dirs = "5.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winnt", "fileapi", "winbase"] }

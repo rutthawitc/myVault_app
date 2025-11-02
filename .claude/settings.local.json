@@ -11,7 +11,11 @@
       "Bash(git remote add:*)",
       "Bash(git branch:*)",
       "Bash(git push:*)",
-      "Bash(git remote set-url:*)"
+      "Bash(git remote set-url:*)",
+      "Bash(git tag:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(cargo test:*)"
     ],
     "deny": [],
     "ask": []

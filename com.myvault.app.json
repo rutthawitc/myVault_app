@@ -1,0 +1,37 @@
+{
+  "app-id": "com.myvault.app",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "22.08",
+  "sdk": "org.freedesktop.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
+  "command": "my_vault",
+  "finish-args": [
+    "--socket=x11",
+    "--socket=wayland",
+    "--share=ipc",
+    "--filesystem=home"
+  ],
+  "modules": [
+    {
+      "name": "myvault",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release",
+        "install -Dm755 target/release/my_vault /app/bin/my_vault",
+        "install -Dm644 myvault.desktop /app/share/applications/com.myvault.app.desktop",
+        "install -Dm644 icon.png /app/share/icons/hicolor/256x256/apps/com.myvault.app.png"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "."
+        }
+      ],
+      "env": {
+        "RUSTFLAGS": "-C target-feature=+crt-static"
+      }
+    }
+  ]
+}
