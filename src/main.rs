@@ -195,6 +195,7 @@ impl MyVaultApp {
         app
     }
 
+    #[allow(dead_code)]
     fn perform_overwrite_lock(&mut self, src: &Path, dst: &Path) -> Result<(), String> {
         let key = self.encryption_key.as_ref().ok_or("Not authenticated")?;
         let data = std::fs::read(src).map_err(|e| e.to_string())?;
@@ -216,6 +217,7 @@ impl MyVaultApp {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn perform_overwrite_unlock(&mut self, src_enc: &Path, dst: &Path) -> Result<(), String> {
         let key = self.encryption_key.as_ref().ok_or("Not authenticated")?;
         let _ = crate::platform::unhide(src_enc);

@@ -61,6 +61,7 @@ pub fn is_encrypted_file(path: &std::path::Path) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn encrypt_blob(key_bytes: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let key = Key::from(*key_bytes);
     let cipher = ChaCha20Poly1305::new(&key);
@@ -77,6 +78,7 @@ pub fn encrypt_blob(key_bytes: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, S
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn decrypt_blob(key_bytes: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() < HEADER_V1.len() + NONCE_LEN + 16 {
         return Err("ciphertext too short".to_string());
