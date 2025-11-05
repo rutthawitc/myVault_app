@@ -974,6 +974,12 @@ impl eframe::App for MyVaultApp {
                         }
                     }
                 });
+
+                // Exit button
+                ui.separator();
+                if ui.button("❌ Exit").on_hover_text("Close application").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
         });
 
