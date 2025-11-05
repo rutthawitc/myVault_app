@@ -617,16 +617,16 @@ impl eframe::App for MyVaultApp {
                 let (result_tx, result_rx) = mpsc::channel();
                 let op_kind = op.kind;
                 let p_clone = p.clone();
-                let perf_config = self.perf_config.clone();
+                let _perf_config = self.perf_config.clone();  // Reserved for future adaptive performance tuning
                 std::thread::spawn(move || {
                     let res = match op_kind {
                         BatchOpKind::LockFolder => {
                             let out = MyVaultApp::encrypted_path_for(&p);
 
                             // Determine encryption strategy based on file size
-                            let file_size = std::fs::metadata(&p)
+                            let _file_size = std::fs::metadata(&p)
                                 .map(|m| m.len())
-                                .unwrap_or(0);
+                                .unwrap_or(0);  // Reserved for future adaptive chunk sizing
 
                             // Use streaming encryption for all files to prevent memory exhaustion
                             // when processing many files in parallel. Streaming is memory-safe and
@@ -869,6 +869,22 @@ impl eframe::App for MyVaultApp {
                 ui.heading("🔒 Please enter password to view files");
             }
 
+            // Phase 2: Drag and drop support (detect at panel level, before borrowing items)
+            if let Some(dropped_files) = ctx.input(|i| {
+                if !i.raw.dropped_files.is_empty() {
+                    Some(i.raw.dropped_files.clone())
+                } else {
+                    None
+                }
+            }) {
+                for file in dropped_files {
+                    if let Some(path) = file.path {
+                        let item_type = if path.is_dir() { ItemType::Folder } else { ItemType::File };
+                        self.add_path(path, item_type);
+                    }
+                }
+            }
+
             // Phase 2: Prepare filtered and sorted items
             let mut display_items: Vec<(usize, &VaultItem)> = self.items.iter().enumerate()
                 .filter(|(_, item)| {
@@ -907,22 +923,6 @@ impl eframe::App for MyVaultApp {
             });
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // Phase 2: Drag and drop support
-                if let Some(dropped_files) = ui.ctx().input(|i| {
-                    if !i.raw.dropped_files.is_empty() {
-                        Some(i.raw.dropped_files.clone())
-                    } else {
-                        None
-                    }
-                }) {
-                    for file in dropped_files {
-                        if let Some(path) = file.path {
-                            let item_type = if path.is_dir() { ItemType::Folder } else { ItemType::File };
-                            self.add_path(path, item_type);
-                        }
-                    }
-                }
-
                 // Show message if filtering resulted in empty list
                 if display_items.is_empty() && !self.items.is_empty() {
                     ui.label("No items match the search filter");
