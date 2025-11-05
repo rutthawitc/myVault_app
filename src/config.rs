@@ -12,6 +12,45 @@ pub struct Config {
     pub master_password_hash: Option<String>,
     pub salt: Option<String>,
     pub vault_items: Vec<ConfigItem>,
+
+    // Phase 2 & 3: Persistent UI preferences
+    #[serde(default)]
+    pub dark_mode: bool,
+    #[serde(default = "default_sort_by")]
+    pub sort_by: String,
+    #[serde(default = "default_true")]
+    pub sort_ascending: bool,
+    #[serde(default)]
+    pub recent_files: Vec<String>,
+
+    // Phase 3: Security settings
+    #[serde(default = "default_session_timeout")]
+    pub session_timeout_minutes: u64,
+    #[serde(default = "default_true")]
+    pub auto_lock_enabled: bool,
+    #[serde(default = "default_password_reminder_days")]
+    pub password_change_reminder_days: u64,
+    #[serde(default)]
+    pub password_last_changed: Option<u64>, // Unix timestamp
+    #[serde(default)]
+    pub reminder_dismissed_until: Option<u64>, // Unix timestamp
+}
+
+// Default value functions for serde
+fn default_sort_by() -> String {
+    "Name".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_session_timeout() -> u64 {
+    15 // 15 minutes default
+}
+
+fn default_password_reminder_days() -> u64 {
+    90 // 90 days default
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,11 +131,33 @@ pub fn load_config() -> io::Result<Config> {
     Ok(cfg)
 }
 
-pub fn save_config(items: &[VaultItem], master_password_hash: Option<&str>, salt: Option<&str>) -> io::Result<()> {
+pub fn save_config(
+    items: &[VaultItem],
+    master_password_hash: Option<&str>,
+    salt: Option<&str>,
+    dark_mode: bool,
+    sort_by: &str,
+    sort_ascending: bool,
+    recent_files: &[String],
+    session_timeout_minutes: u64,
+    auto_lock_enabled: bool,
+    password_change_reminder_days: u64,
+    password_last_changed: Option<u64>,
+    reminder_dismissed_until: Option<u64>,
+) -> io::Result<()> {
     let cfg = Config {
         master_password_hash: master_password_hash.map(|s| s.to_string()),
         salt: salt.map(|s| s.to_string()),
         vault_items: items.iter().map(ConfigItem::from).collect(),
+        dark_mode,
+        sort_by: sort_by.to_string(),
+        sort_ascending,
+        recent_files: recent_files.to_vec(),
+        session_timeout_minutes,
+        auto_lock_enabled,
+        password_change_reminder_days,
+        password_last_changed,
+        reminder_dismissed_until,
     };
     let json = serde_json::to_vec_pretty(&cfg).unwrap_or_else(|_| b"{}".to_vec());
     let path = config_path();

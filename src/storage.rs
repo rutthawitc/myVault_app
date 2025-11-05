@@ -222,6 +222,7 @@ impl StorageInfo {
     }
 
     /// Check if Windows path is network (UNC path)
+    #[allow(dead_code)]
     #[cfg(target_os = "windows")]
     fn is_network_mount(path: &Path) -> bool {
         if let Some(path_str) = path.to_str() {

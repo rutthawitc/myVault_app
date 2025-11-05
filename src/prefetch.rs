@@ -215,8 +215,8 @@ impl Drop for Prefetcher {
 pub struct ReadAheadQueue {
     /// Buffered chunks waiting to be processed
     chunks: Arc<Mutex<Vec<PrefetchedChunk>>>,
-    /// Prefetcher instance
-    prefetcher: Option<Prefetcher>,
+    /// Prefetcher instance (kept alive for lifetime management)
+    _prefetcher: Option<Prefetcher>,
 }
 
 impl ReadAheadQueue {
@@ -224,7 +224,7 @@ impl ReadAheadQueue {
     pub fn new(prefetch_config: PrefetchConfig) -> Self {
         Self {
             chunks: Arc::new(Mutex::new(Vec::new())),
-            prefetcher: if prefetch_config.enabled {
+            _prefetcher: if prefetch_config.enabled {
                 Some(Prefetcher::new(prefetch_config))
             } else {
                 None

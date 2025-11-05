@@ -61,6 +61,7 @@ pub fn is_encrypted_file(path: &std::path::Path) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn encrypt_blob(key_bytes: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let key = Key::from(*key_bytes);
     let cipher = ChaCha20Poly1305::new(&key);
@@ -77,6 +78,7 @@ pub fn encrypt_blob(key_bytes: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, S
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn decrypt_blob(key_bytes: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() < HEADER_V1.len() + NONCE_LEN + 16 {
         return Err("ciphertext too short".to_string());
@@ -332,6 +334,7 @@ fn decrypt_file_streaming_v1(
 /// - 10GB file on 16-core CPU: ~4-5 seconds
 /// - Memory usage: constant (mmap handles paging)
 /// - CPU utilization: 90%+ across all threads
+#[allow(dead_code)]
 pub fn encrypt_file_parallel(
     key_bytes: &[u8; 32],
     input_path: &std::path::Path,
@@ -427,6 +430,7 @@ pub fn encrypt_file_parallel(
 /// - 10GB file on 16-core CPU: ~4-5 seconds
 /// - Memory usage: constant
 /// - CPU utilization: 90%+
+#[allow(dead_code)]
 pub fn decrypt_file_parallel(
     key_bytes: &[u8; 32],
     input_path: &std::path::Path,
