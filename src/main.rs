@@ -1288,6 +1288,9 @@ impl eframe::App for MyVaultApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.vertical(|ui| {
+                        // Track if Enter key was pressed for auto-submit
+                        let mut enter_pressed = false;
+
                         if has_hash {
                             ui.label("Enter your master password:");
                             let resp = ui.add(
@@ -1295,7 +1298,9 @@ impl eframe::App for MyVaultApp {
                                     .password(true)
                                     .hint_text("Password"),
                             );
-                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {}
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                enter_pressed = true;
+                            }
                         } else {
                             ui.label("Create a master password (store it safely):");
                             ui.add(
@@ -1333,11 +1338,15 @@ impl eframe::App for MyVaultApp {
                                 });
                             }
 
-                            ui.add(
+                            let confirm_resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.temp_password_confirm)
                                     .password(true)
                                     .hint_text("Confirm password"),
                             );
+                            // Auto-submit on Enter in confirm field
+                            if confirm_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                enter_pressed = true;
+                            }
                         }
 
                         ui.horizontal(|ui| {
@@ -1357,7 +1366,8 @@ impl eframe::App for MyVaultApp {
                             }
 
                             if has_hash {
-                                if ui.button("Enter").clicked() {
+                                // Trigger authentication on button click OR Enter key
+                                if ui.button("Enter").clicked() || enter_pressed {
                                     match (&self.master_password_hash).as_deref() {
                                         Some(hash) => match crypto::verify_password(&self.temp_password, hash) {
                                             Ok(true) => {
@@ -1388,7 +1398,8 @@ impl eframe::App for MyVaultApp {
                                     self.temp_password.clear();
                                 }
                             } else {
-                                if ui.button("Create").clicked() {
+                                // Trigger password creation on button click OR Enter key
+                                if ui.button("Create").clicked() || enter_pressed {
                                     if self.temp_password.is_empty() {
                                         self.status_message = "Password cannot be empty".to_string();
                                     } else if self.temp_password != self.temp_password_confirm {
@@ -1437,6 +1448,9 @@ impl eframe::App for MyVaultApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
+                    // Track if Enter key was pressed for auto-submit
+                    let mut enter_pressed = false;
+
                     ui.label("Current password:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.current_password)
@@ -1483,11 +1497,15 @@ impl eframe::App for MyVaultApp {
                     }
 
                     ui.label("Confirm new password:");
-                    ui.add(
+                    let confirm_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.new_password_confirm)
                             .password(true)
                             .hint_text("Confirm new password"),
                     );
+                    // Auto-submit on Enter in confirm field
+                    if confirm_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        enter_pressed = true;
+                    }
 
                     ui.horizontal(|ui| {
                         // Phase 3: Password generator button
@@ -1506,7 +1524,8 @@ impl eframe::App for MyVaultApp {
                             self.new_password_confirm.clear();
                         }
 
-                        if ui.button("Change Password").clicked() {
+                        // Trigger password change on button click OR Enter key
+                        if ui.button("Change Password").clicked() || enter_pressed {
                             // Verify current password
                             if let Some(hash) = &self.master_password_hash {
                                 match crypto::verify_password(&self.current_password, hash) {
