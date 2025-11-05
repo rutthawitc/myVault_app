@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_controller_no_change() {
-        let mut controller = AdaptiveController::new(100_000_000, 4, 8);
+        let controller = AdaptiveController::new(100_000_000, 4, 8);
 
         // Simulate being at target throughput
         controller.monitor.record(100_000_000);
