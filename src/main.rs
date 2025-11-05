@@ -109,6 +109,7 @@ struct MyVaultApp {
     current_password: String,
     new_password: String,
     new_password_confirm: String,
+    dark_mode: bool,  // Phase 1: Dark mode toggle
 }
 
 impl MyVaultApp {
@@ -135,6 +136,7 @@ impl MyVaultApp {
             current_password: String::new(),
             new_password: String::new(),
             new_password_confirm: String::new(),
+            dark_mode: false,  // Default to light mode
         };
         app.load_from_config();
         app
@@ -484,6 +486,13 @@ impl MyVaultApp {
 
 impl eframe::App for MyVaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Phase 1: Apply dark mode theme
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
         // Process background/batched folder operations with parallel encryption
         if let Some(mut op) = self.current_op.take() {
             // Use dynamic thread count based on CPU cores and detected file sizes
@@ -672,6 +681,12 @@ impl eframe::App for MyVaultApp {
                         self.show_change_password_dialog = true;
                     }
                 }
+                ui.separator();
+                // Phase 1: Dark mode toggle
+                let theme_label = if self.dark_mode { "☀ Light Mode" } else { "🌙 Dark Mode" };
+                if ui.button(theme_label).clicked() {
+                    self.dark_mode = !self.dark_mode;
+                }
             });
         });
 
@@ -829,6 +844,36 @@ impl eframe::App for MyVaultApp {
                                     .password(true)
                                     .hint_text("Password"),
                             );
+
+                            // Phase 1: Password strength meter
+                            let (strength_level, strength_color, strength_label) = assess_password_strength(&self.temp_password);
+                            if !self.temp_password.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Strength:");
+                                    // Visual strength bar
+                                    let bar_width = 150.0;
+                                    let bar_height = 8.0;
+                                    let filled_width = bar_width * ((strength_level + 1) as f32 / 3.0);
+
+                                    let (rect, _response) = ui.allocate_exact_size(
+                                        egui::vec2(bar_width, bar_height),
+                                        egui::Sense::hover()
+                                    );
+
+                                    // Draw background
+                                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+
+                                    // Draw filled portion
+                                    let filled_rect = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(filled_width, bar_height)
+                                    );
+                                    ui.painter().rect_filled(filled_rect, 2.0, strength_color);
+
+                                    ui.colored_label(strength_color, strength_label);
+                                });
+                            }
+
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.temp_password_confirm)
                                     .password(true)
@@ -934,6 +979,35 @@ impl eframe::App for MyVaultApp {
                             .password(true)
                             .hint_text("New password"),
                     );
+
+                    // Phase 1: Password strength meter for new password
+                    let (strength_level, strength_color, strength_label) = assess_password_strength(&self.new_password);
+                    if !self.new_password.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Strength:");
+                            // Visual strength bar
+                            let bar_width = 150.0;
+                            let bar_height = 8.0;
+                            let filled_width = bar_width * ((strength_level + 1) as f32 / 3.0);
+
+                            let (rect, _response) = ui.allocate_exact_size(
+                                egui::vec2(bar_width, bar_height),
+                                egui::Sense::hover()
+                            );
+
+                            // Draw background
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+
+                            // Draw filled portion
+                            let filled_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(filled_width, bar_height)
+                            );
+                            ui.painter().rect_filled(filled_rect, 2.0, strength_color);
+
+                            ui.colored_label(strength_color, strength_label);
+                        });
+                    }
 
                     ui.label("Confirm new password:");
                     ui.add(
@@ -1117,13 +1191,21 @@ impl eframe::App for MyVaultApp {
                             close_error_report = true;
                         }
                         if ui.button("Copy to Clipboard").clicked() {
-                            let _report = errors
+                            let report = errors
                                 .iter()
                                 .enumerate()
                                 .map(|(i, (p, e))| format!("{}. {}\n   Error: {}\n", i + 1, p.display(), e))
                                 .collect::<String>();
-                            // Note: In a real app, you'd use a clipboard library here
-                            self.status_message = format!("Report copied (manual clipboard support needed)");
+
+                            // Phase 1: Clipboard support implementation
+                            match platform::set_clipboard(&report) {
+                                Ok(_) => {
+                                    self.status_message = format!("Error report copied to clipboard ({} items)", errors.len());
+                                }
+                                Err(e) => {
+                                    self.status_message = format!("Failed to copy to clipboard: {}", e);
+                                }
+                            }
                         }
                     });
                 });
@@ -1139,12 +1221,39 @@ impl eframe::App for MyVaultApp {
             let queue_len = op.queue.len();
             let failures = op.failures;
             let kind = op.kind;
-            let (progress, text) = if scanning_done {
+            let start_time = op.start_time;
+
+            // Phase 1: Calculate throughput and ETA
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let throughput = if elapsed > 0.0 && processed > 0 {
+                processed as f32 / elapsed
+            } else {
+                0.0
+            };
+
+            let (progress, text, eta_text) = if scanning_done {
                 let total = processed + queue_len;
                 let pct = if total == 0 { 0.0 } else { processed as f32 / total as f32 };
-                (pct, format!("Processed {} of {} ({} errors)", processed, total, failures))
+                let eta = if throughput > 0.0 && queue_len > 0 {
+                    let remaining_secs = queue_len as f32 / throughput;
+                    if remaining_secs < 60.0 {
+                        format!("ETA: {:.0}s", remaining_secs)
+                    } else if remaining_secs < 3600.0 {
+                        format!("ETA: {:.1}m", remaining_secs / 60.0)
+                    } else {
+                        format!("ETA: {:.1}h", remaining_secs / 3600.0)
+                    }
+                } else {
+                    String::new()
+                };
+                let throughput_str = if throughput > 0.0 {
+                    format!("Speed: {:.1} files/s", throughput)
+                } else {
+                    String::new()
+                };
+                (pct, format!("Processed {} of {} ({} errors)", processed, total, failures), format!("{} {}", throughput_str, eta).trim().to_string())
             } else {
-                (0.0, format!("Scanning... processed {} (+{} queued), {} errors", processed, queue_len, failures))
+                (0.0, format!("Scanning... processed {} (+{} queued), {} errors", processed, queue_len, failures), String::new())
             };
             let title = match kind { BatchOpKind::LockFolder => "Locking Folder", BatchOpKind::UnlockFolder => "Unlocking Folder" };
             let mut cancel_clicked = false;
@@ -1154,6 +1263,9 @@ impl eframe::App for MyVaultApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label(&text);
+                    if !eta_text.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(100, 149, 237), &eta_text);
+                    }
                     if scanning_done {
                         ui.add(egui::widgets::ProgressBar::new(progress).show_percentage());
                     } else {
@@ -1171,6 +1283,55 @@ impl eframe::App for MyVaultApp {
                 self.current_op = None;
             }
         }
+    }
+}
+
+/// Phase 1: Password strength assessment
+/// Returns (strength_level, color, label)
+/// - Level 0 (Weak): < 8 chars or simple patterns
+/// - Level 1 (Medium): 8-11 chars with some complexity
+/// - Level 2 (Strong): 12+ chars with high complexity
+fn assess_password_strength(password: &str) -> (u8, egui::Color32, &'static str) {
+    if password.is_empty() {
+        return (0, egui::Color32::GRAY, "");
+    }
+
+    let len = password.len();
+    let has_lower = password.chars().any(|c| c.is_lowercase());
+    let has_upper = password.chars().any(|c| c.is_uppercase());
+    let has_digit = password.chars().any(|c| c.is_numeric());
+    let has_special = password.chars().any(|c| !c.is_alphanumeric());
+
+    let complexity = [has_lower, has_upper, has_digit, has_special]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    // Check for common patterns
+    let is_sequential = password.chars().collect::<Vec<_>>().windows(3).any(|w| {
+        if w.len() == 3 {
+            let c1 = w[0] as i32;
+            let c2 = w[1] as i32;
+            let c3 = w[2] as i32;
+            (c2 - c1 == 1 && c3 - c2 == 1) || (c1 - c2 == 1 && c2 - c3 == 1)
+        } else {
+            false
+        }
+    });
+
+    let is_repetitive = password.chars().collect::<Vec<_>>().windows(3).any(|w| {
+        w.len() == 3 && w[0] == w[1] && w[1] == w[2]
+    });
+
+    // Scoring logic
+    if len < 8 || is_sequential || is_repetitive {
+        (0, egui::Color32::from_rgb(220, 53, 69), "Weak")
+    } else if len >= 12 && complexity >= 3 {
+        (2, egui::Color32::from_rgb(40, 167, 69), "Strong")
+    } else if len >= 8 && complexity >= 2 {
+        (1, egui::Color32::from_rgb(255, 193, 7), "Medium")
+    } else {
+        (0, egui::Color32::from_rgb(220, 53, 69), "Weak")
     }
 }
 

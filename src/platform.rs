@@ -167,3 +167,66 @@ pub fn is_linux() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// Phase 1: Copy text to clipboard
+#[cfg(target_os = "windows")]
+pub fn set_clipboard(text: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use winapi::um::winuser::{OpenClipboard, EmptyClipboard, SetClipboardData, CloseClipboard};
+    use winapi::um::winbase::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    unsafe {
+        // Open clipboard
+        if OpenClipboard(ptr::null_mut()) == 0 {
+            return Err("Failed to open clipboard".to_string());
+        }
+
+        // Empty clipboard
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return Err("Failed to empty clipboard".to_string());
+        }
+
+        // Convert text to wide string (UTF-16)
+        let wide: Vec<u16> = OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let len = wide.len() * std::mem::size_of::<u16>();
+
+        // Allocate global memory
+        let h_mem = GlobalAlloc(GMEM_MOVEABLE, len);
+        if h_mem.is_null() {
+            CloseClipboard();
+            return Err("Failed to allocate memory".to_string());
+        }
+
+        // Lock memory and copy data
+        let p_mem = GlobalLock(h_mem);
+        if p_mem.is_null() {
+            CloseClipboard();
+            return Err("Failed to lock memory".to_string());
+        }
+
+        ptr::copy_nonoverlapping(wide.as_ptr(), p_mem as *mut u16, wide.len());
+        GlobalUnlock(h_mem);
+
+        // Set clipboard data (CF_UNICODETEXT = 13)
+        const CF_UNICODETEXT: u32 = 13;
+        if SetClipboardData(CF_UNICODETEXT, h_mem).is_null() {
+            CloseClipboard();
+            return Err("Failed to set clipboard data".to_string());
+        }
+
+        CloseClipboard();
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_clipboard(_text: &str) -> Result<(), String> {
+    Err("Clipboard not supported on this platform yet".to_string())
+}
+
