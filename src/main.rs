@@ -760,12 +760,15 @@ impl eframe::App for MyVaultApp {
             }
 
             // Collect results from completed background threads
+            // Phase 3: Collect successful paths to add to recent files after retain_mut
+            let mut successful_paths = Vec::new();
+
             self.op_result_rxs.retain_mut(|rx| {
                 match rx.try_recv() {
                     Ok((path, success, error_msg)) => {
                         if success {
-                            // Phase 3: Track successful operations in recent files
-                            self.add_to_recent_files(path.clone());
+                            // Phase 3: Store path for later addition to recent files
+                            successful_paths.push(path);
                         } else {
                             op.failures += 1;
                             if let Some(err) = error_msg {
@@ -782,6 +785,11 @@ impl eframe::App for MyVaultApp {
                     }
                 }
             });
+
+            // Phase 3: Add successful paths to recent files (after retain_mut to avoid borrow conflicts)
+            for path in successful_paths {
+                self.add_to_recent_files(path);
+            }
 
             // Spawn new background threads up to max_parallel limit
             while self.op_result_rxs.len() < max_parallel && !op.queue.is_empty() {
@@ -1477,15 +1485,8 @@ impl eframe::App for MyVaultApp {
                     ui.horizontal(|ui| {
                         // Phase 3: Password generator button
                         if ui.button("🔐 Generate").on_hover_text("Open password generator").clicked() {
-                            // Save new_password fields to temporary storage
-                            let temp_new = self.new_password.clone();
-                            let temp_confirm = self.new_password_confirm.clone();
-
-                            // Open generator (it will update temp_password fields)
+                            // Open generator (it will populate new_password fields when "Use This Password" is clicked)
                             self.show_password_generator = true;
-
-                            // After generator closes, we'll need to copy to new_password
-                            // This will be handled by modifying the generator dialog
                         }
 
                         if ui.button("Cancel").clicked() {
