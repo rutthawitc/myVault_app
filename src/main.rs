@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::collections::{VecDeque, HashSet};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 fn main() -> eframe::Result<()> {
     let mut options = eframe::NativeOptions::default();
@@ -115,6 +115,24 @@ struct MyVaultApp {
     recent_files: Vec<PathBuf>,
     sort_by: SortField,
     sort_ascending: bool,
+    // Phase 3: Security & Persistence
+    last_activity: Instant,
+    session_timeout_minutes: u64,
+    auto_lock_enabled: bool,
+    password_last_changed: Option<SystemTime>,
+    password_change_reminder_days: u64,
+    show_password_generator: bool,
+    generated_password: String,
+    show_settings_dialog: bool,
+    // Password generator settings
+    gen_length: usize,
+    gen_use_lowercase: bool,
+    gen_use_uppercase: bool,
+    gen_use_digits: bool,
+    gen_use_symbols: bool,
+    // Password reminder tracking
+    show_password_reminder: bool,
+    reminder_dismissed_until: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +172,24 @@ impl MyVaultApp {
             recent_files: Vec::new(),
             sort_by: SortField::Name,
             sort_ascending: true,
+            // Phase 3: Security & Persistence
+            last_activity: Instant::now(),
+            session_timeout_minutes: 15,  // Default: 15 minutes
+            auto_lock_enabled: true,  // Default: enabled for security
+            password_last_changed: None,  // Will be loaded from config
+            password_change_reminder_days: 90,  // Default: 90 days
+            show_password_generator: false,
+            generated_password: String::new(),
+            show_settings_dialog: false,
+            // Password generator settings
+            gen_length: 16,  // Default: 16 characters
+            gen_use_lowercase: true,
+            gen_use_uppercase: true,
+            gen_use_digits: true,
+            gen_use_symbols: true,
+            // Password reminder tracking
+            show_password_reminder: false,
+            reminder_dismissed_until: None,
         };
         app.load_from_config();
         app
@@ -173,6 +209,8 @@ impl MyVaultApp {
                 item.is_locked = true;
             }
         }
+        // Phase 3: Track in recent files
+        self.add_to_recent_files(src.to_path_buf());
         self.save_config();
         self.status_message = "Locked file (overwritten)".to_string();
         Ok(())
@@ -194,6 +232,8 @@ impl MyVaultApp {
                 item.original_path = dst.to_path_buf();
             }
         }
+        // Phase 3: Track in recent files
+        self.add_to_recent_files(dst.to_path_buf());
         self.save_config();
         self.status_message = "Unlocked file (overwritten)".to_string();
         Ok(())
@@ -205,6 +245,28 @@ impl MyVaultApp {
                 self.master_password_hash = cfg.master_password_hash;
                 self.salt = cfg.salt;
                 self.items = cfg.vault_items.iter().map(|c| c.into()).collect();
+
+                // Phase 2 & 3: Restore UI preferences
+                self.dark_mode = cfg.dark_mode;
+                self.sort_by = match cfg.sort_by.as_str() {
+                    "Status" => SortField::Status,
+                    "Size" => SortField::Size,
+                    _ => SortField::Name,
+                };
+                self.sort_ascending = cfg.sort_ascending;
+                self.recent_files = cfg.recent_files.iter().map(PathBuf::from).collect();
+
+                // Phase 3: Restore security settings
+                self.session_timeout_minutes = cfg.session_timeout_minutes;
+                self.auto_lock_enabled = cfg.auto_lock_enabled;
+                self.password_change_reminder_days = cfg.password_change_reminder_days;
+                self.password_last_changed = cfg.password_last_changed.map(|timestamp| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp)
+                });
+                self.reminder_dismissed_until = cfg.reminder_dismissed_until.map(|timestamp| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp)
+                });
+
                 self.status_message = "Loaded configuration".to_string();
             }
             Err(e) => {
@@ -214,9 +276,109 @@ impl MyVaultApp {
     }
 
     fn save_config(&mut self) {
-        if let Err(e) = config::save_config(&self.items, self.master_password_hash.as_deref(), self.salt.as_deref()) {
+        // Convert SystemTime to Unix timestamp for storage
+        let password_timestamp = self.password_last_changed.and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+
+        let reminder_timestamp = self.reminder_dismissed_until.and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+
+        // Convert SortField to String
+        let sort_by_str = match self.sort_by {
+            SortField::Name => "Name",
+            SortField::Status => "Status",
+            SortField::Size => "Size",
+        };
+
+        // Convert Vec<PathBuf> to Vec<String>
+        let recent_files_strings: Vec<String> = self.recent_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        if let Err(e) = config::save_config(
+            &self.items,
+            self.master_password_hash.as_deref(),
+            self.salt.as_deref(),
+            self.dark_mode,
+            sort_by_str,
+            self.sort_ascending,
+            &recent_files_strings,
+            self.session_timeout_minutes,
+            self.auto_lock_enabled,
+            self.password_change_reminder_days,
+            password_timestamp,
+            reminder_timestamp,
+        ) {
             self.status_message = format!("Failed to save config: {}", e);
         }
+    }
+
+    // Phase 3: Add file to recent files list (keep last 20)
+    fn add_to_recent_files(&mut self, path: PathBuf) {
+        // Remove if already exists (to move it to front)
+        self.recent_files.retain(|p| p != &path);
+        // Add to front
+        self.recent_files.insert(0, path);
+        // Keep only last 20
+        if self.recent_files.len() > 20 {
+            self.recent_files.truncate(20);
+        }
+    }
+
+    // Phase 3: Check if password change reminder should be shown
+    fn check_password_reminder(&mut self) {
+        // Don't show if reminder was dismissed recently
+        if let Some(dismissed_until) = self.reminder_dismissed_until {
+            if SystemTime::now() < dismissed_until {
+                return; // Still in the "remind me later" period
+            }
+        }
+
+        // Check if password is old enough to warrant a reminder
+        if let Some(last_changed) = self.password_last_changed {
+            if let Ok(age) = SystemTime::now().duration_since(last_changed) {
+                let age_days = age.as_secs() / 86400; // Convert to days
+                if age_days >= self.password_change_reminder_days {
+                    self.show_password_reminder = true;
+                }
+            }
+        }
+    }
+
+    // Phase 3: Generate secure random password
+    fn generate_password(&self) -> String {
+        use rand::Rng;
+
+        let mut charset = Vec::new();
+        if self.gen_use_lowercase {
+            charset.extend_from_slice(b"abcdefghijklmnopqrstuvwxyz");
+        }
+        if self.gen_use_uppercase {
+            charset.extend_from_slice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        }
+        if self.gen_use_digits {
+            charset.extend_from_slice(b"0123456789");
+        }
+        if self.gen_use_symbols {
+            charset.extend_from_slice(b"!@#$%^&*()-_=+[]{}|;:,.<>?");
+        }
+
+        // If no character sets selected, use all
+        if charset.is_empty() {
+            charset.extend_from_slice(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?");
+        }
+
+        let mut rng = rand::thread_rng();
+        (0..self.gen_length)
+            .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+            .collect()
     }
 
     fn add_path(&mut self, path: PathBuf, item_type: ItemType) {
@@ -510,6 +672,24 @@ impl eframe::App for MyVaultApp {
             ctx.set_visuals(egui::Visuals::light());
         }
 
+        // Phase 3: Session timeout check
+        if self.auto_lock_enabled && self.authenticated {
+            let elapsed_minutes = self.last_activity.elapsed().as_secs() / 60;
+            if elapsed_minutes >= self.session_timeout_minutes {
+                // Auto-lock: clear authentication
+                self.authenticated = false;
+                self.encryption_key = None;
+                self.status_message = format!("🔒 Session timed out after {} minutes of inactivity. Please re-authenticate.", self.session_timeout_minutes);
+                // Reset activity timer
+                self.last_activity = Instant::now();
+            }
+        }
+
+        // Phase 3: Update activity timestamp on any user interaction
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.last_activity = Instant::now();
+        }
+
         // Phase 2: Keyboard shortcuts
         let busy = self.current_op.is_some();
         if !busy && self.authenticated && !self.show_password_dialog && !self.show_change_password_dialog {
@@ -583,7 +763,10 @@ impl eframe::App for MyVaultApp {
             self.op_result_rxs.retain_mut(|rx| {
                 match rx.try_recv() {
                     Ok((path, success, error_msg)) => {
-                        if !success {
+                        if success {
+                            // Phase 3: Track successful operations in recent files
+                            self.add_to_recent_files(path.clone());
+                        } else {
                             op.failures += 1;
                             if let Some(err) = error_msg {
                                 op.error_details.push((path, err));
@@ -751,8 +934,89 @@ impl eframe::App for MyVaultApp {
                 if ui.button(theme_label).clicked() {
                     self.dark_mode = !self.dark_mode;
                 }
+                // Phase 3: Settings button
+                if ui.button("⚙ Settings").on_hover_text("Configure app settings").clicked() {
+                    self.show_settings_dialog = true;
+                }
+
+                // Phase 3: Recent Files dropdown
+                ui.menu_button("📂 Recent Files", |ui| {
+                    if self.recent_files.is_empty() {
+                        ui.label("No recent files");
+                    } else {
+                        ui.label("Click to add back to list:");
+                        ui.separator();
+
+                        let recent_files_clone = self.recent_files.clone();
+                        for (idx, path) in recent_files_clone.iter().enumerate() {
+                            if idx >= 20 { break; } // Show max 20 files
+
+                            let file_name = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("Unknown");
+
+                            if ui.button(format!("{}. {}", idx + 1, file_name))
+                                .on_hover_text(path.to_string_lossy().as_ref())
+                                .clicked()
+                            {
+                                let item_type = if path.is_dir() { ItemType::Folder } else { ItemType::File };
+                                self.add_path(path.clone(), item_type);
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                });
             });
         });
+
+        // Phase 3: Password change reminder banner
+        if self.authenticated && self.show_password_reminder {
+            egui::TopBottomPanel::top("password_reminder").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 100), "⚠");
+
+                    let age_str = if let Some(last_changed) = self.password_last_changed {
+                        if let Ok(age) = SystemTime::now().duration_since(last_changed) {
+                            let days = age.as_secs() / 86400;
+                            format!("Your password is {} days old. ", days)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    ui.label(format!("{}Consider changing it for better security.", age_str));
+
+                    if ui.button("Change Now").clicked() {
+                        self.show_change_password_dialog = true;
+                        self.show_password_reminder = false;
+                    }
+
+                    if ui.button("Remind Me in 7 Days").clicked() {
+                        // Dismiss reminder for 7 days
+                        self.reminder_dismissed_until = Some(
+                            SystemTime::now() + std::time::Duration::from_secs(7 * 24 * 60 * 60)
+                        );
+                        self.show_password_reminder = false;
+                        self.save_config();
+                    }
+
+                    if ui.button("Don't Remind Me").clicked() {
+                        // Dismiss reminder indefinitely
+                        self.reminder_dismissed_until = Some(
+                            SystemTime::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60) // 1 year
+                        );
+                        self.show_password_reminder = false;
+                        self.save_config();
+                    }
+
+                    if ui.button("✖").clicked() {
+                        self.show_password_reminder = false;
+                    }
+                });
+            });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("Files & folders list");
@@ -1062,6 +1326,13 @@ impl eframe::App for MyVaultApp {
                         }
 
                         ui.horizontal(|ui| {
+                            // Phase 3: Password generator button (only for password creation, not authentication)
+                            if !has_hash {
+                                if ui.button("🔐 Generate").on_hover_text("Open password generator").clicked() {
+                                    self.show_password_generator = true;
+                                }
+                            }
+
                             if ui.button("Cancel").clicked() {
                                 self.show_password_dialog = false;
                                 self.temp_password.zeroize();
@@ -1085,6 +1356,9 @@ impl eframe::App for MyVaultApp {
                                                 self.authenticated = true;
                                                 self.status_message = "Authenticated".to_string();
                                                 self.show_password_dialog = false;
+
+                                                // Phase 3: Check if password change reminder should be shown
+                                                self.check_password_reminder();
                                             }
                                             Ok(false) => {
                                                 self.status_message = "Invalid password".to_string();
@@ -1118,6 +1392,10 @@ impl eframe::App for MyVaultApp {
                                                 }
                                                 self.authenticated = true;
                                                 self.status_message = "Master password created".to_string();
+
+                                                // Phase 3: Record password creation time
+                                                self.password_last_changed = Some(SystemTime::now());
+
                                                 self.save_config();
                                                 self.show_password_dialog = false;
                                             }
@@ -1197,6 +1475,19 @@ impl eframe::App for MyVaultApp {
                     );
 
                     ui.horizontal(|ui| {
+                        // Phase 3: Password generator button
+                        if ui.button("🔐 Generate").on_hover_text("Open password generator").clicked() {
+                            // Save new_password fields to temporary storage
+                            let temp_new = self.new_password.clone();
+                            let temp_confirm = self.new_password_confirm.clone();
+
+                            // Open generator (it will update temp_password fields)
+                            self.show_password_generator = true;
+
+                            // After generator closes, we'll need to copy to new_password
+                            // This will be handled by modifying the generator dialog
+                        }
+
                         if ui.button("Cancel").clicked() {
                             self.show_change_password_dialog = false;
                             self.current_password.zeroize();
@@ -1229,6 +1520,12 @@ impl eframe::App for MyVaultApp {
                                                     match crypto::derive_key(&self.new_password, &new_salt) {
                                                         Ok(new_key) => {
                                                             self.encryption_key = Some(new_key);
+
+                                                            // Phase 3: Record password change time and hide reminder
+                                                            self.password_last_changed = Some(SystemTime::now());
+                                                            self.show_password_reminder = false;
+                                                            self.reminder_dismissed_until = None;
+
                                                             self.save_config();
                                                             self.status_message = "Master password changed successfully".to_string();
                                                             self.show_change_password_dialog = false;
@@ -1260,6 +1557,165 @@ impl eframe::App for MyVaultApp {
                             self.new_password.clear();
                             self.new_password_confirm.zeroize();
                             self.new_password_confirm.clear();
+                        }
+                    });
+                });
+        }
+
+        // Phase 3: Settings dialog
+        if self.show_settings_dialog {
+            egui::Window::new("⚙ Settings")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.heading("Security Settings");
+                    ui.separator();
+
+                    // Session Timeout Settings
+                    ui.label("Auto-Lock:");
+                    ui.checkbox(&mut self.auto_lock_enabled, "Enable session timeout");
+
+                    ui.add_enabled(
+                        self.auto_lock_enabled,
+                        egui::Slider::new(&mut self.session_timeout_minutes, 1..=60)
+                            .text("minutes")
+                            .suffix(" min")
+                    );
+
+                    if self.auto_lock_enabled {
+                        ui.label(format!("⏱ App will auto-lock after {} minutes of inactivity", self.session_timeout_minutes));
+                    } else {
+                        ui.label("⚠ Auto-lock disabled (not recommended)");
+                    }
+
+                    ui.separator();
+
+                    // Password Change Reminder Settings
+                    ui.label("Password Change Reminder:");
+                    ui.add(
+                        egui::Slider::new(&mut self.password_change_reminder_days, 30..=365)
+                            .text("days")
+                            .suffix(" days")
+                    );
+                    ui.label(format!("📅 Remind me to change password every {} days", self.password_change_reminder_days));
+
+                    ui.separator();
+
+                    // Manual Lock button
+                    if self.authenticated {
+                        if ui.button("🔒 Lock Now").clicked() {
+                            self.authenticated = false;
+                            self.encryption_key = None;
+                            self.status_message = "🔒 Session locked manually".to_string();
+                            self.show_settings_dialog = false;
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Close button
+                    if ui.button("Close").clicked() {
+                        self.show_settings_dialog = false;
+                        self.save_config(); // Save settings
+                    }
+                });
+        }
+
+        // Phase 3: Password Generator dialog
+        if self.show_password_generator {
+            egui::Window::new("🔐 Password Generator")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.heading("Generate Secure Password");
+                    ui.separator();
+
+                    // Length slider
+                    ui.label("Password Length:");
+                    ui.add(egui::Slider::new(&mut self.gen_length, 8..=128).text("characters"));
+
+                    ui.separator();
+
+                    // Character type checkboxes
+                    ui.label("Include:");
+                    ui.checkbox(&mut self.gen_use_lowercase, "Lowercase (a-z)");
+                    ui.checkbox(&mut self.gen_use_uppercase, "Uppercase (A-Z)");
+                    ui.checkbox(&mut self.gen_use_digits, "Digits (0-9)");
+                    ui.checkbox(&mut self.gen_use_symbols, "Symbols (!@#$%^&*...)");
+
+                    ui.separator();
+
+                    // Generate button
+                    if ui.button("🎲 Generate").clicked() {
+                        self.generated_password = self.generate_password();
+                    }
+
+                    // Display generated password
+                    if !self.generated_password.is_empty() {
+                        ui.label("Generated Password:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.generated_password)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(300.0)
+                            );
+
+                            // Copy to clipboard button
+                            if ui.button("📋 Copy").clicked() {
+                                if let Err(e) = crate::platform::set_clipboard(&self.generated_password) {
+                                    self.status_message = format!("Failed to copy: {}", e);
+                                } else {
+                                    self.status_message = "Password copied to clipboard!".to_string();
+                                }
+                            }
+                        });
+
+                        // Password strength indicator
+                        let (strength_level, strength_color, strength_label) = assess_password_strength(&self.generated_password);
+                        ui.horizontal(|ui| {
+                            ui.label("Strength:");
+                            let bar_width = 200.0;
+                            let bar_height = 8.0;
+                            let filled_width = (bar_width * strength_level as f32) / 100.0;
+
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_width, bar_height),
+                                egui::Sense::hover()
+                            );
+
+                            ui.painter().rect_filled(rect, 4.0, egui::Color32::DARK_GRAY);
+                            let filled_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(filled_width, bar_height)
+                            );
+                            ui.painter().rect_filled(filled_rect, 4.0, strength_color);
+
+                            ui.label(egui::RichText::new(strength_label).color(strength_color));
+                        });
+                    }
+
+                    ui.separator();
+
+                    // Action buttons
+                    ui.horizontal(|ui| {
+                        if ui.button("Use This Password").clicked() && !self.generated_password.is_empty() {
+                            // Determine which dialog is open and copy to appropriate fields
+                            if self.show_change_password_dialog {
+                                // Copy to change password dialog fields
+                                self.new_password = self.generated_password.clone();
+                                self.new_password_confirm = self.generated_password.clone();
+                            } else {
+                                // Copy to create/enter password dialog fields
+                                self.temp_password = self.generated_password.clone();
+                                self.temp_password_confirm = self.generated_password.clone();
+                            }
+                            self.show_password_generator = false;
+                        }
+
+                        if ui.button("Close").clicked() {
+                            self.show_password_generator = false;
                         }
                     });
                 });
