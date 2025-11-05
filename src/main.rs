@@ -1214,8 +1214,15 @@ impl eframe::App for MyVaultApp {
                         if item.is_locked { "🔒" } else { "🔓" }
                     );
 
+                    // Color locked items in red for easy visual distinction
+                    let label_text = if item.is_locked {
+                        egui::RichText::new(label).color(egui::Color32::from_rgb(220, 50, 50))
+                    } else {
+                        egui::RichText::new(label)
+                    };
+
                     // Multi-select with Ctrl+click and Shift+click for range selection
-                    if ui.selectable_label(is_selected, label).clicked() {
+                    if ui.selectable_label(is_selected, label_text).clicked() {
                         let modifiers = ui.ctx().input(|i| i.modifiers);
                         if modifiers.shift {
                             // Range select with Shift held
