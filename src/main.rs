@@ -495,42 +495,6 @@ impl MyVaultApp {
         Some(encrypted.with_file_name(trimmed))
     }
 
-    fn lock_file(&mut self, path: &Path, interactive: bool) -> Result<PathBuf, String> {
-        let key = self.encryption_key.as_ref().ok_or("Not authenticated")?;
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let blob = crate::crypto::encrypt_blob(key, &data)?;
-        let out = Self::encrypted_path_for(path);
-        if out.exists() {
-            if interactive {
-                self.status_message = format!("Encrypted file exists: {}", out.display());
-                self.confirm_action = Some(ConfirmAction::OverwriteLock { src: path.to_path_buf(), dst: out.clone() });
-            }
-            return Err("Encrypted file already exists".to_string());
-        }
-        std::fs::write(&out, blob).map_err(|e| e.to_string())?;
-        let _ = crate::platform::hide(&out);
-        std::fs::remove_file(path).map_err(|e| e.to_string())?;
-        Ok(out)
-    }
-
-    fn unlock_file(&mut self, enc_path: &Path, interactive: bool) -> Result<PathBuf, String> {
-        let key = self.encryption_key.as_ref().ok_or("Not authenticated")?;
-        let _ = crate::platform::unhide(enc_path);
-        let data = std::fs::read(enc_path).map_err(|e| e.to_string())?;
-        let plain = crate::crypto::decrypt_blob(key, &data)?;
-        let out = Self::original_path_for(enc_path).ok_or("Invalid encrypted filename")?;
-        if out.exists() {
-            if interactive {
-                self.status_message = format!("Original file exists: {}", out.display());
-                self.confirm_action = Some(ConfirmAction::OverwriteUnlock { src: enc_path.to_path_buf(), dst: out.clone() });
-            }
-            return Err("Original file already exists".to_string());
-        }
-        std::fs::write(&out, plain).map_err(|e| e.to_string())?;
-        std::fs::remove_file(enc_path).map_err(|e| e.to_string())?;
-        Ok(out)
-    }
-
     fn lock_selected(&mut self) {
         if self.selected.is_empty() {
             return;
@@ -585,7 +549,7 @@ impl MyVaultApp {
             scanning_done: true,
             processed: 0,
             failures: 0,
-            item_index: *selected_indices.first().unwrap(),
+            _item_index: *selected_indices.first().unwrap(),
             affected_items: selected_indices.clone(),
             error_details: Vec::new(),
             start_time: Instant::now(),
@@ -652,7 +616,7 @@ impl MyVaultApp {
             scanning_done: true,
             processed: 0,
             failures: 0,
-            item_index: *selected_indices.first().unwrap(),
+            _item_index: *selected_indices.first().unwrap(),
             affected_items: selected_indices.clone(),
             error_details: Vec::new(),
             start_time: Instant::now(),
@@ -1761,8 +1725,6 @@ impl eframe::App for MyVaultApp {
                     ConfirmAction::Lock => "Confirm Lock",
                     ConfirmAction::Unlock => "Confirm Unlock",
                     ConfirmAction::Remove => "Confirm Remove",
-                    ConfirmAction::OverwriteLock { .. } | ConfirmAction::OverwriteUnlock { .. } => "Confirm Overwrite",
-                    ConfirmAction::ChangePassword => "Confirm Change Password",
                 };
                 egui::Window::new(title)
                     .collapsible(false)
@@ -1780,9 +1742,6 @@ impl eframe::App for MyVaultApp {
                             ConfirmAction::Lock => ui.label("This will encrypt and hide the selected item."),
                             ConfirmAction::Unlock => ui.label("This will decrypt and restore the selected item."),
                             ConfirmAction::Remove => ui.label("This removes the item from the list only; it does not delete files."),
-                            ConfirmAction::OverwriteLock { ref dst, .. } => ui.label(format!("Encrypted file exists: {}\nOverwrite?", dst.display())),
-                            ConfirmAction::OverwriteUnlock { ref dst, .. } => ui.label(format!("Original file exists: {}\nOverwrite?", dst.display())),
-                            ConfirmAction::ChangePassword => ui.label("This will update your master password."),
                         };
                         ui.label(format!("Item: {}",
                             item_desc
@@ -1795,28 +1754,12 @@ impl eframe::App for MyVaultApp {
                                 ConfirmAction::Lock => "Lock",
                                 ConfirmAction::Unlock => "Unlock",
                                 ConfirmAction::Remove => "Remove",
-                                ConfirmAction::OverwriteLock { .. } => "Overwrite",
-                                ConfirmAction::OverwriteUnlock { .. } => "Overwrite",
-                                ConfirmAction::ChangePassword => "Change",
                             };
                             if ui.button(confirm_label).clicked() {
                                 match action {
                                     ConfirmAction::Lock => self.lock_selected(),
                                     ConfirmAction::Unlock => self.unlock_selected(),
                                     ConfirmAction::Remove => self.remove_selected(),
-                                    ConfirmAction::OverwriteLock { src, dst } => {
-                                        if let Err(e) = self.perform_overwrite_lock(&src, &dst) {
-                                            self.status_message = format!("Overwrite failed: {}", e);
-                                        }
-                                    }
-                                    ConfirmAction::OverwriteUnlock { src, dst } => {
-                                        if let Err(e) = self.perform_overwrite_unlock(&src, &dst) {
-                                            self.status_message = format!("Overwrite failed: {}", e);
-                                        }
-                                    }
-                                    ConfirmAction::ChangePassword => {
-                                        // This action is handled directly in the change password dialog
-                                    }
                                 }
                                 self.confirm_action = None;
                             }
@@ -2030,7 +1973,7 @@ struct BatchOp {
     scanning_done: bool,
     processed: usize,
     failures: usize,
-    item_index: usize,
+    _item_index: usize,  // Reserved for future use
     affected_items: Vec<usize>,  // All item indices involved in this batch operation
     error_details: Vec<(PathBuf, String)>,  // Detailed error tracking: (file_path, error_reason)
     start_time: Instant,  // Track operation start time
@@ -2047,7 +1990,4 @@ enum ConfirmAction {
     Lock,
     Unlock,
     Remove,
-    OverwriteLock { src: PathBuf, dst: PathBuf },
-    OverwriteUnlock { src: PathBuf, dst: PathBuf },
-    ChangePassword,
 }

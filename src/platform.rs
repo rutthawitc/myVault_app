@@ -68,21 +68,25 @@ pub fn hide(_path: &Path) -> io::Result<()> { Ok(()) }
 pub fn unhide(_path: &Path) -> io::Result<()> { Ok(()) }
 
 /// Get the platform identifier
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 pub fn platform() -> &'static str {
     "windows"
 }
 
+#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 pub fn platform() -> &'static str {
     "macos"
 }
 
+#[allow(dead_code)]
 #[cfg(target_os = "linux")]
 pub fn platform() -> &'static str {
     "linux"
 }
 
+#[allow(dead_code)]
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn platform() -> &'static str {
     "unknown"
@@ -122,6 +126,7 @@ pub fn config_dir() -> io::Result<PathBuf> {
 }
 
 /// Get the cache directory path
+#[allow(dead_code)]
 pub fn cache_dir() -> io::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -153,16 +158,19 @@ pub fn cache_dir() -> io::Result<PathBuf> {
 }
 
 /// Check if running on Windows
+#[allow(dead_code)]
 pub fn is_windows() -> bool {
     cfg!(target_os = "windows")
 }
 
 /// Check if running on macOS
+#[allow(dead_code)]
 pub fn is_macos() -> bool {
     cfg!(target_os = "macos")
 }
 
 /// Check if running on Linux
+#[allow(dead_code)]
 pub fn is_linux() -> bool {
     cfg!(target_os = "linux")
 }

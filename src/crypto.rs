@@ -332,6 +332,7 @@ fn decrypt_file_streaming_v1(
 /// - 10GB file on 16-core CPU: ~4-5 seconds
 /// - Memory usage: constant (mmap handles paging)
 /// - CPU utilization: 90%+ across all threads
+#[allow(dead_code)]
 pub fn encrypt_file_parallel(
     key_bytes: &[u8; 32],
     input_path: &std::path::Path,
@@ -427,6 +428,7 @@ pub fn encrypt_file_parallel(
 /// - 10GB file on 16-core CPU: ~4-5 seconds
 /// - Memory usage: constant
 /// - CPU utilization: 90%+
+#[allow(dead_code)]
 pub fn decrypt_file_parallel(
     key_bytes: &[u8; 32],
     input_path: &std::path::Path,
