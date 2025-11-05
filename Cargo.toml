@@ -26,4 +26,4 @@ memmap2 = "0.9"
 dirs = "5.0"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winnt", "fileapi", "winbase"] }
+winapi = { version = "0.3", features = ["winnt", "fileapi", "winbase", "winuser", "shellapi"] }

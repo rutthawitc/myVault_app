@@ -109,6 +109,19 @@ struct MyVaultApp {
     current_password: String,
     new_password: String,
     new_password_confirm: String,
+    dark_mode: bool,  // Phase 1: Dark mode toggle
+    // Phase 2: UX Improvements
+    search_filter: String,
+    recent_files: Vec<PathBuf>,
+    sort_by: SortField,
+    sort_ascending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortField {
+    Name,
+    Status,
+    Size,
 }
 
 impl MyVaultApp {
@@ -135,6 +148,12 @@ impl MyVaultApp {
             current_password: String::new(),
             new_password: String::new(),
             new_password_confirm: String::new(),
+            dark_mode: false,  // Default to light mode
+            // Phase 2: UX Improvements
+            search_filter: String::new(),
+            recent_files: Vec::new(),
+            sort_by: SortField::Name,
+            sort_ascending: true,
         };
         app.load_from_config();
         app
@@ -484,6 +503,60 @@ impl MyVaultApp {
 
 impl eframe::App for MyVaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Phase 1: Apply dark mode theme
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
+        // Phase 2: Keyboard shortcuts
+        let busy = self.current_op.is_some();
+        if !busy && self.authenticated && !self.show_password_dialog && !self.show_change_password_dialog {
+            ctx.input(|i| {
+                // Ctrl+A: Select all
+                if i.modifiers.ctrl && i.key_pressed(egui::Key::A) {
+                    self.selected.clear();
+                    for idx in 0..self.items.len() {
+                        self.selected.insert(idx);
+                    }
+                }
+
+                // Ctrl+L: Lock selected files
+                if i.modifiers.ctrl && i.key_pressed(egui::Key::L) {
+                    let has_selection = !self.selected.is_empty();
+                    let some_selected_unlocked = self.selected.iter()
+                        .any(|&idx| self.items.get(idx).map(|it| !it.is_locked).unwrap_or(false));
+                    if has_selection && some_selected_unlocked {
+                        self.confirm_action = Some(ConfirmAction::Lock);
+                    }
+                }
+
+                // Ctrl+U: Unlock selected files
+                if i.modifiers.ctrl && i.key_pressed(egui::Key::U) {
+                    let has_selection = !self.selected.is_empty();
+                    let all_selected_locked = !self.selected.is_empty() &&
+                        self.selected.iter().all(|&idx| self.items.get(idx).map(|it| it.is_locked).unwrap_or(false));
+                    if has_selection && all_selected_locked {
+                        self.confirm_action = Some(ConfirmAction::Unlock);
+                    }
+                }
+
+                // Delete: Remove selected items
+                if i.key_pressed(egui::Key::Delete) {
+                    if !self.selected.is_empty() {
+                        self.confirm_action = Some(ConfirmAction::Remove);
+                    }
+                }
+
+                // Escape: Clear selection
+                if i.key_pressed(egui::Key::Escape) {
+                    self.selected.clear();
+                    self.last_selected = None;
+                }
+            });
+        }
+
         // Process background/batched folder operations with parallel encryption
         if let Some(mut op) = self.current_op.take() {
             // Use dynamic thread count based on CPU cores and detected file sizes
@@ -544,16 +617,16 @@ impl eframe::App for MyVaultApp {
                 let (result_tx, result_rx) = mpsc::channel();
                 let op_kind = op.kind;
                 let p_clone = p.clone();
-                let perf_config = self.perf_config.clone();
+                let _perf_config = self.perf_config.clone();  // Reserved for future adaptive performance tuning
                 std::thread::spawn(move || {
                     let res = match op_kind {
                         BatchOpKind::LockFolder => {
                             let out = MyVaultApp::encrypted_path_for(&p);
 
                             // Determine encryption strategy based on file size
-                            let file_size = std::fs::metadata(&p)
+                            let _file_size = std::fs::metadata(&p)
                                 .map(|m| m.len())
-                                .unwrap_or(0);
+                                .unwrap_or(0);  // Reserved for future adaptive chunk sizing
 
                             // Use streaming encryption for all files to prevent memory exhaustion
                             // when processing many files in parallel. Streaming is memory-safe and
@@ -672,6 +745,12 @@ impl eframe::App for MyVaultApp {
                         self.show_change_password_dialog = true;
                     }
                 }
+                ui.separator();
+                // Phase 1: Dark mode toggle
+                let theme_label = if self.dark_mode { "☀ Light Mode" } else { "🌙 Dark Mode" };
+                if ui.button(theme_label).clicked() {
+                    self.dark_mode = !self.dark_mode;
+                }
             });
         });
 
@@ -681,18 +760,24 @@ impl eframe::App for MyVaultApp {
 
             ui.horizontal(|ui| {
                 let busy = self.current_op.is_some();
-                if ui.add_enabled(!busy, egui::Button::new("Add File")).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new("Add File"))
+                    .on_hover_text("Add a single file to encrypt/decrypt")
+                    .clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
                         self.add_path(path, ItemType::File);
                     }
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Add Folder")).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new("Add Folder"))
+                    .on_hover_text("Add a folder - all files will be processed")
+                    .clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.add_path(path, ItemType::Folder);
                     }
                 }
 
-                if ui.add_enabled(!busy, egui::Button::new("Scan for Locked Files")).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new("Scan for Locked Files"))
+                    .on_hover_text("Scan a folder for previously encrypted files")
+                    .clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.scan_locked_files(&path);
                     }
@@ -706,16 +791,22 @@ impl eframe::App for MyVaultApp {
                 let has_selection = !self.selected.is_empty();
 
                 let can_lock = !busy && has_selection && self.authenticated && some_selected_unlocked;
-                if ui.add_enabled(can_lock, egui::Button::new("Lock")).clicked() {
+                if ui.add_enabled(can_lock, egui::Button::new("Lock"))
+                    .on_hover_text("Encrypt selected files (Ctrl+L)")
+                    .clicked() {
                     self.confirm_action = Some(ConfirmAction::Lock);
                 }
 
                 let can_unlock = !busy && has_selection && self.authenticated && all_selected_locked;
-                if ui.add_enabled(can_unlock, egui::Button::new("Unlock")).clicked() {
+                if ui.add_enabled(can_unlock, egui::Button::new("Unlock"))
+                    .on_hover_text("Decrypt selected files (Ctrl+U)")
+                    .clicked() {
                     self.confirm_action = Some(ConfirmAction::Unlock);
                 }
 
-                if ui.add_enabled(!busy && has_selection, egui::Button::new("Remove")).clicked() {
+                if ui.add_enabled(!busy && has_selection, egui::Button::new("Remove"))
+                    .on_hover_text("Remove from list (doesn't delete files) (Delete)")
+                    .clicked() {
                     self.confirm_action = Some(ConfirmAction::Remove);
                 }
 
@@ -723,6 +814,48 @@ impl eframe::App for MyVaultApp {
                 if has_selection {
                     ui.label(format!("Selected: {}", self.selected.len()));
                 }
+            });
+
+            // Phase 2: Search and sort controls
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                ui.add(egui::TextEdit::singleline(&mut self.search_filter)
+                    .hint_text("Filter by filename..."));
+
+                if ui.small_button("✖").on_hover_text("Clear search").clicked() {
+                    self.search_filter.clear();
+                }
+
+                ui.separator();
+
+                ui.label("Sort by:");
+                if ui.selectable_label(self.sort_by == SortField::Name, "Name").on_hover_text("Sort by filename").clicked() {
+                    if self.sort_by == SortField::Name {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_by = SortField::Name;
+                        self.sort_ascending = true;
+                    }
+                }
+                if ui.selectable_label(self.sort_by == SortField::Status, "Status").on_hover_text("Sort by lock status").clicked() {
+                    if self.sort_by == SortField::Status {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_by = SortField::Status;
+                        self.sort_ascending = true;
+                    }
+                }
+                if ui.selectable_label(self.sort_by == SortField::Size, "Size").on_hover_text("Sort by file size").clicked() {
+                    if self.sort_by == SortField::Size {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_by = SortField::Size;
+                        self.sort_ascending = true;
+                    }
+                }
+
+                let arrow = if self.sort_ascending { "⬆" } else { "⬇" };
+                ui.label(arrow);
             });
 
             ui.separator();
@@ -736,13 +869,75 @@ impl eframe::App for MyVaultApp {
                 ui.heading("🔒 Please enter password to view files");
             }
 
+            // Phase 2: Drag and drop support (detect at panel level, before borrowing items)
+            if let Some(dropped_files) = ctx.input(|i| {
+                if !i.raw.dropped_files.is_empty() {
+                    Some(i.raw.dropped_files.clone())
+                } else {
+                    None
+                }
+            }) {
+                for file in dropped_files {
+                    if let Some(path) = file.path {
+                        let item_type = if path.is_dir() { ItemType::Folder } else { ItemType::File };
+                        self.add_path(path, item_type);
+                    }
+                }
+            }
+
+            // Phase 2: Prepare filtered and sorted items
+            let mut display_items: Vec<(usize, &VaultItem)> = self.items.iter().enumerate()
+                .filter(|(_, item)| {
+                    // Filter by search string
+                    if self.search_filter.is_empty() {
+                        true
+                    } else {
+                        let search_lower = self.search_filter.to_lowercase();
+                        item.original_path.to_string_lossy().to_lowercase().contains(&search_lower)
+                    }
+                })
+                .collect();
+
+            // Sort items
+            display_items.sort_by(|(_, a), (_, b)| {
+                let ordering = match self.sort_by {
+                    SortField::Name => {
+                        a.original_path.file_name().unwrap_or_default()
+                            .to_string_lossy()
+                            .cmp(&b.original_path.file_name().unwrap_or_default().to_string_lossy())
+                    }
+                    SortField::Status => {
+                        a.is_locked.cmp(&b.is_locked)
+                    }
+                    SortField::Size => {
+                        let size_a = std::fs::metadata(&a.original_path).map(|m| m.len()).unwrap_or(0);
+                        let size_b = std::fs::metadata(&b.original_path).map(|m| m.len()).unwrap_or(0);
+                        size_a.cmp(&size_b)
+                    }
+                };
+                if self.sort_ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            });
+
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, item) in self.items.iter().enumerate() {
-                    let is_selected = self.selected.contains(&i);
+                // Show message if filtering resulted in empty list
+                if display_items.is_empty() && !self.items.is_empty() {
+                    ui.label("No items match the search filter");
+                } else if self.items.is_empty() {
+                    ui.label("No files added yet. Use buttons above or drag & drop files here.");
+                }
+
+                for (idx, item) in display_items.iter() {
+                    let is_selected = self.selected.contains(idx);
+                    let file_size = format_file_size(&item.original_path);
                     let label = format!(
-                        "{}  {}  {} {}",
+                        "{}  {}  {}  {} {}",
                         match item.item_type { ItemType::File => "[F]", ItemType::Folder => "[D]" },
                         item.original_path.display(),
+                        file_size,
                         if item.is_locked { "Locked" } else { "Unlocked" },
                         if item.is_locked { "🔒" } else { "🔓" }
                     );
@@ -753,28 +948,28 @@ impl eframe::App for MyVaultApp {
                         if modifiers.shift {
                             // Range select with Shift held
                             if let Some(last) = self.last_selected {
-                                let start = last.min(i);
-                                let end = last.max(i);
+                                let start = last.min(*idx);
+                                let end = last.max(*idx);
                                 for j in start..=end {
                                     self.selected.insert(j);
                                 }
                             } else {
-                                self.selected.insert(i);
+                                self.selected.insert(*idx);
                             }
-                            self.last_selected = Some(i);
+                            self.last_selected = Some(*idx);
                         } else if modifiers.ctrl {
                             // Toggle with Ctrl held
                             if is_selected {
-                                self.selected.remove(&i);
+                                self.selected.remove(idx);
                             } else {
-                                self.selected.insert(i);
+                                self.selected.insert(*idx);
                             }
-                            self.last_selected = Some(i);
+                            self.last_selected = Some(*idx);
                         } else {
                             // Single select without modifiers
                             self.selected.clear();
-                            self.selected.insert(i);
-                            self.last_selected = Some(i);
+                            self.selected.insert(*idx);
+                            self.last_selected = Some(*idx);
                         }
                     }
                 }
@@ -829,6 +1024,36 @@ impl eframe::App for MyVaultApp {
                                     .password(true)
                                     .hint_text("Password"),
                             );
+
+                            // Phase 1: Password strength meter
+                            let (strength_level, strength_color, strength_label) = assess_password_strength(&self.temp_password);
+                            if !self.temp_password.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Strength:");
+                                    // Visual strength bar
+                                    let bar_width = 150.0;
+                                    let bar_height = 8.0;
+                                    let filled_width = bar_width * ((strength_level + 1) as f32 / 3.0);
+
+                                    let (rect, _response) = ui.allocate_exact_size(
+                                        egui::vec2(bar_width, bar_height),
+                                        egui::Sense::hover()
+                                    );
+
+                                    // Draw background
+                                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+
+                                    // Draw filled portion
+                                    let filled_rect = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(filled_width, bar_height)
+                                    );
+                                    ui.painter().rect_filled(filled_rect, 2.0, strength_color);
+
+                                    ui.colored_label(strength_color, strength_label);
+                                });
+                            }
+
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.temp_password_confirm)
                                     .password(true)
@@ -934,6 +1159,35 @@ impl eframe::App for MyVaultApp {
                             .password(true)
                             .hint_text("New password"),
                     );
+
+                    // Phase 1: Password strength meter for new password
+                    let (strength_level, strength_color, strength_label) = assess_password_strength(&self.new_password);
+                    if !self.new_password.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Strength:");
+                            // Visual strength bar
+                            let bar_width = 150.0;
+                            let bar_height = 8.0;
+                            let filled_width = bar_width * ((strength_level + 1) as f32 / 3.0);
+
+                            let (rect, _response) = ui.allocate_exact_size(
+                                egui::vec2(bar_width, bar_height),
+                                egui::Sense::hover()
+                            );
+
+                            // Draw background
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+
+                            // Draw filled portion
+                            let filled_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(filled_width, bar_height)
+                            );
+                            ui.painter().rect_filled(filled_rect, 2.0, strength_color);
+
+                            ui.colored_label(strength_color, strength_label);
+                        });
+                    }
 
                     ui.label("Confirm new password:");
                     ui.add(
@@ -1117,13 +1371,21 @@ impl eframe::App for MyVaultApp {
                             close_error_report = true;
                         }
                         if ui.button("Copy to Clipboard").clicked() {
-                            let _report = errors
+                            let report = errors
                                 .iter()
                                 .enumerate()
                                 .map(|(i, (p, e))| format!("{}. {}\n   Error: {}\n", i + 1, p.display(), e))
                                 .collect::<String>();
-                            // Note: In a real app, you'd use a clipboard library here
-                            self.status_message = format!("Report copied (manual clipboard support needed)");
+
+                            // Phase 1: Clipboard support implementation
+                            match platform::set_clipboard(&report) {
+                                Ok(_) => {
+                                    self.status_message = format!("Error report copied to clipboard ({} items)", errors.len());
+                                }
+                                Err(e) => {
+                                    self.status_message = format!("Failed to copy to clipboard: {}", e);
+                                }
+                            }
                         }
                     });
                 });
@@ -1139,12 +1401,39 @@ impl eframe::App for MyVaultApp {
             let queue_len = op.queue.len();
             let failures = op.failures;
             let kind = op.kind;
-            let (progress, text) = if scanning_done {
+            let start_time = op.start_time;
+
+            // Phase 1: Calculate throughput and ETA
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let throughput = if elapsed > 0.0 && processed > 0 {
+                processed as f32 / elapsed
+            } else {
+                0.0
+            };
+
+            let (progress, text, eta_text) = if scanning_done {
                 let total = processed + queue_len;
                 let pct = if total == 0 { 0.0 } else { processed as f32 / total as f32 };
-                (pct, format!("Processed {} of {} ({} errors)", processed, total, failures))
+                let eta = if throughput > 0.0 && queue_len > 0 {
+                    let remaining_secs = queue_len as f32 / throughput;
+                    if remaining_secs < 60.0 {
+                        format!("ETA: {:.0}s", remaining_secs)
+                    } else if remaining_secs < 3600.0 {
+                        format!("ETA: {:.1}m", remaining_secs / 60.0)
+                    } else {
+                        format!("ETA: {:.1}h", remaining_secs / 3600.0)
+                    }
+                } else {
+                    String::new()
+                };
+                let throughput_str = if throughput > 0.0 {
+                    format!("Speed: {:.1} files/s", throughput)
+                } else {
+                    String::new()
+                };
+                (pct, format!("Processed {} of {} ({} errors)", processed, total, failures), format!("{} {}", throughput_str, eta).trim().to_string())
             } else {
-                (0.0, format!("Scanning... processed {} (+{} queued), {} errors", processed, queue_len, failures))
+                (0.0, format!("Scanning... processed {} (+{} queued), {} errors", processed, queue_len, failures), String::new())
             };
             let title = match kind { BatchOpKind::LockFolder => "Locking Folder", BatchOpKind::UnlockFolder => "Unlocking Folder" };
             let mut cancel_clicked = false;
@@ -1154,6 +1443,9 @@ impl eframe::App for MyVaultApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label(&text);
+                    if !eta_text.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(100, 149, 237), &eta_text);
+                    }
                     if scanning_done {
                         ui.add(egui::widgets::ProgressBar::new(progress).show_percentage());
                     } else {
@@ -1171,6 +1463,73 @@ impl eframe::App for MyVaultApp {
                 self.current_op = None;
             }
         }
+    }
+}
+
+/// Phase 2: Get file size with human-readable format
+fn format_file_size(path: &Path) -> String {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let size = metadata.len();
+        if size < 1024 {
+            format!("{} B", size)
+        } else if size < 1024 * 1024 {
+            format!("{:.1} KB", size as f64 / 1024.0)
+        } else if size < 1024 * 1024 * 1024 {
+            format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{:.2} GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+        }
+    } else {
+        "N/A".to_string()
+    }
+}
+
+/// Phase 1: Password strength assessment
+/// Returns (strength_level, color, label)
+/// - Level 0 (Weak): < 8 chars or simple patterns
+/// - Level 1 (Medium): 8-11 chars with some complexity
+/// - Level 2 (Strong): 12+ chars with high complexity
+fn assess_password_strength(password: &str) -> (u8, egui::Color32, &'static str) {
+    if password.is_empty() {
+        return (0, egui::Color32::GRAY, "");
+    }
+
+    let len = password.len();
+    let has_lower = password.chars().any(|c| c.is_lowercase());
+    let has_upper = password.chars().any(|c| c.is_uppercase());
+    let has_digit = password.chars().any(|c| c.is_numeric());
+    let has_special = password.chars().any(|c| !c.is_alphanumeric());
+
+    let complexity = [has_lower, has_upper, has_digit, has_special]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    // Check for common patterns
+    let is_sequential = password.chars().collect::<Vec<_>>().windows(3).any(|w| {
+        if w.len() == 3 {
+            let c1 = w[0] as i32;
+            let c2 = w[1] as i32;
+            let c3 = w[2] as i32;
+            (c2 - c1 == 1 && c3 - c2 == 1) || (c1 - c2 == 1 && c2 - c3 == 1)
+        } else {
+            false
+        }
+    });
+
+    let is_repetitive = password.chars().collect::<Vec<_>>().windows(3).any(|w| {
+        w.len() == 3 && w[0] == w[1] && w[1] == w[2]
+    });
+
+    // Scoring logic
+    if len < 8 || is_sequential || is_repetitive {
+        (0, egui::Color32::from_rgb(220, 53, 69), "Weak")
+    } else if len >= 12 && complexity >= 3 {
+        (2, egui::Color32::from_rgb(40, 167, 69), "Strong")
+    } else if len >= 8 && complexity >= 2 {
+        (1, egui::Color32::from_rgb(255, 193, 7), "Medium")
+    } else {
+        (0, egui::Color32::from_rgb(220, 53, 69), "Weak")
     }
 }
 
