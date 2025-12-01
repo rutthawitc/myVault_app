@@ -389,6 +389,7 @@ impl MyVaultApp {
             encrypted_path: None,
             is_locked: false,
             item_type,
+            is_folder_hidden: false,
         };
         self.items.push(item);
         let idx = self.items.len() - 1;
@@ -443,6 +444,7 @@ impl MyVaultApp {
                             encrypted_path: Some(file_path.to_path_buf()),
                             is_locked: true,
                             item_type: ItemType::File,
+                            is_folder_hidden: false,
                         };
                         self.items.push(item);
                         found_count += 1;
@@ -574,6 +576,21 @@ impl MyVaultApp {
         let mut selected_indices: Vec<_> = self.selected.iter().copied().collect();
         selected_indices.sort();
 
+        // Unhide folders BEFORE collecting files
+        let folder_indices: Vec<usize> = selected_indices.iter()
+            .filter(|&&idx| {
+                self.items.get(idx)
+                    .map(|item| item.item_type == ItemType::Folder && item.is_folder_hidden)
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+
+        if !folder_indices.is_empty() {
+            self.last_error_report.clear();
+            self.unhide_folders(folder_indices);
+        }
+
         // Process each selected item and collect encrypted files/folders
         let mut all_files = VecDeque::new();
         let suffix = Self::encrypted_suffix().to_string();
@@ -626,6 +643,119 @@ impl MyVaultApp {
 
         let file_count = self.current_op.as_ref().unwrap().queue.len();
         self.status_message = format!("Starting unlock: {} files from {} items...", file_count, selected_indices.len());
+    }
+
+    fn hide_folders(&mut self, folder_indices: Vec<usize>) {
+        let mut hidden_count = 0;
+        let mut error_count = 0;
+
+        for idx in folder_indices {
+            if let Some(item) = self.items.get_mut(idx) {
+                if item.item_type == ItemType::Folder && !item.is_folder_hidden {
+                    let folder_path = &item.original_path;
+
+                    // Check if folder exists
+                    if !folder_path.exists() {
+                        self.last_error_report.push((
+                            folder_path.clone(),
+                            "Folder does not exist".to_string()
+                        ));
+                        error_count += 1;
+                        continue;
+                    }
+
+                    // Check if it's a directory
+                    if !folder_path.is_dir() {
+                        self.last_error_report.push((
+                            folder_path.clone(),
+                            "Path is not a directory".to_string()
+                        ));
+                        error_count += 1;
+                        continue;
+                    }
+
+                    // Hide the folder
+                    match crate::platform::hide(folder_path) {
+                        Ok(_) => {
+                            item.is_folder_hidden = true;
+                            hidden_count += 1;
+                        }
+                        Err(e) => {
+                            self.last_error_report.push((
+                                folder_path.clone(),
+                                format!("Failed to hide folder: {}", e)
+                            ));
+                            error_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Save config if any folders were hidden
+        if hidden_count > 0 {
+            self.save_config();
+        }
+
+        // Update status message
+        if error_count > 0 {
+            self.status_message = format!(
+                "Hidden {} folder(s), {} error(s) - click 'View Error Report'",
+                hidden_count, error_count
+            );
+            self.show_error_report = true;
+        } else if hidden_count > 0 {
+            self.status_message = format!("Hidden {} folder(s)", hidden_count);
+        }
+    }
+
+    fn unhide_folders(&mut self, folder_indices: Vec<usize>) {
+        let mut unhidden_count = 0;
+        let mut error_count = 0;
+
+        for idx in folder_indices {
+            if let Some(item) = self.items.get_mut(idx) {
+                if item.item_type == ItemType::Folder && item.is_folder_hidden {
+                    let folder_path = &item.original_path;
+
+                    // Check if folder exists
+                    if !folder_path.exists() {
+                        // Folder was deleted - just update state
+                        item.is_folder_hidden = false;
+                        continue;
+                    }
+
+                    // Unhide the folder
+                    match crate::platform::unhide(folder_path) {
+                        Ok(_) => {
+                            item.is_folder_hidden = false;
+                            unhidden_count += 1;
+                        }
+                        Err(e) => {
+                            self.last_error_report.push((
+                                folder_path.clone(),
+                                format!("Failed to unhide folder: {}", e)
+                            ));
+                            error_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Save config if any folders were unhidden
+        if unhidden_count > 0 {
+            self.save_config();
+        }
+
+        // Show errors if any
+        if error_count > 0 {
+            self.status_message = format!(
+                "Unhidden {} folder(s), {} error(s) - click 'View Error Report'",
+                unhidden_count, error_count
+            );
+            self.show_error_report = true;
+        }
     }
 }
 
@@ -848,6 +978,33 @@ impl eframe::App for MyVaultApp {
                         }
                     }
                 }
+
+                // Hide folders after successful lock
+                if matches!(op.kind, BatchOpKind::LockFolder) {
+                    let folder_indices: Vec<usize> = op.affected_items.iter()
+                        .filter(|&&idx| {
+                            self.items.get(idx)
+                                .map(|item| item.item_type == ItemType::Folder)
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                        .collect();
+
+                    if !folder_indices.is_empty() {
+                        if op.failures == 0 {
+                            // All files succeeded - hide immediately
+                            self.hide_folders(folder_indices);
+                        } else {
+                            // Some failures - ask for confirmation
+                            self.confirm_action = Some(ConfirmAction::HideFolderWithFailures {
+                                folder_indices,
+                                total_files: op.processed,
+                                failed_files: op.failures,
+                            });
+                        }
+                    }
+                }
+
                 self.save_config();
 
                 // Store error details for display
@@ -870,16 +1027,46 @@ impl eframe::App for MyVaultApp {
                 };
 
                 let msg = match op.kind {
-                    BatchOpKind::LockFolder => if op.failures == 0 {
-                        format!("Locked {} items in {}", op.affected_items.len(), time_str)
-                    } else {
-                        format!("Locked {} items with {} errors in {} - click 'View Error Report' to see details", op.affected_items.len(), op.failures, time_str)
+                    BatchOpKind::LockFolder => {
+                        let folder_count = op.affected_items.iter()
+                            .filter(|&&idx| {
+                                self.items.get(idx)
+                                    .map(|item| item.item_type == ItemType::Folder)
+                                    .unwrap_or(false)
+                            })
+                            .count();
+
+                        if op.failures == 0 {
+                            if folder_count > 0 {
+                                format!("Locked and hidden {} folder(s) with {} files in {}",
+                                    folder_count, op.processed, time_str)
+                            } else {
+                                format!("Locked {} items in {}", op.affected_items.len(), time_str)
+                            }
+                        } else {
+                            format!("Locked {} items with {} errors in {} - click 'View Error Report' to see details", op.affected_items.len(), op.failures, time_str)
+                        }
                     },
-                    BatchOpKind::UnlockFolder => if op.failures == 0 {
-                        format!("Unlocked {} items in {}", op.affected_items.len(), time_str)
-                    } else {
-                        format!("Unlocked {} items with {} errors in {} - click 'View Error Report' to see details", op.affected_items.len(), op.failures, time_str)
-                    },
+                    BatchOpKind::UnlockFolder => {
+                        let folder_count = op.affected_items.iter()
+                            .filter(|&&idx| {
+                                self.items.get(idx)
+                                    .map(|item| item.item_type == ItemType::Folder)
+                                    .unwrap_or(false)
+                            })
+                            .count();
+
+                        if op.failures == 0 {
+                            if folder_count > 0 {
+                                format!("Unlocked and unhidden {} folder(s) with {} files in {}",
+                                    folder_count, op.processed, time_str)
+                            } else {
+                                format!("Unlocked {} items in {}", op.affected_items.len(), time_str)
+                            }
+                        } else {
+                            format!("Unlocked {} items with {} errors in {} - click 'View Error Report' to see details", op.affected_items.len(), op.failures, time_str)
+                        }
+                    }
                 };
                 self.status_message = msg;
                 // completed
@@ -1724,48 +1911,74 @@ impl eframe::App for MyVaultApp {
         if !self.show_password_dialog && !self.show_change_password_dialog {
             if let Some(action) = self.confirm_action.clone() {
                 let title = match action {
-                    ConfirmAction::Lock => "Confirm Lock",
-                    ConfirmAction::Unlock => "Confirm Unlock",
-                    ConfirmAction::Remove => "Confirm Remove",
+                    ConfirmAction::Lock => "Confirm Lock".to_string(),
+                    ConfirmAction::Unlock => "Confirm Unlock".to_string(),
+                    ConfirmAction::Remove => "Confirm Remove".to_string(),
+                    ConfirmAction::HideFolderWithFailures { .. } => "Hide Folders with Failures".to_string(),
                 };
                 egui::Window::new(title)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
-                        let item_desc = if let Some(&i) = self.selected.iter().next() {
-                            self.items.get(i)
-                                .map(|it| format!("{}", it.original_path.display()))
-                                .unwrap_or_else(|| "<none>".to_string())
-                        } else {
-                            "<none>".to_string()
-                        };
                         match action {
-                            ConfirmAction::Lock => ui.label("This will encrypt and hide the selected item."),
-                            ConfirmAction::Unlock => ui.label("This will decrypt and restore the selected item."),
-                            ConfirmAction::Remove => ui.label("This removes the item from the list only; it does not delete files."),
-                        };
-                        ui.label(format!("Item: {}",
-                            item_desc
-                        ));
-                        ui.horizontal(|ui| {
-                            if ui.button("Cancel").clicked() {
-                                self.confirm_action = None;
+                            ConfirmAction::HideFolderWithFailures { ref folder_indices, total_files, failed_files } => {
+                                ui.label(format!(
+                                    "⚠️ {} out of {} files failed to encrypt.",
+                                    failed_files, total_files
+                                ));
+                                ui.label("Do you still want to hide the folder(s)?");
+                                ui.label("Hidden folders with failed files may cause confusion.");
+
+                                ui.horizontal(|ui| {
+                                    if ui.button("Hide Folder Anyway").clicked() {
+                                        self.hide_folders(folder_indices.clone());
+                                        self.confirm_action = None;
+                                    }
+                                    if ui.button("Keep Folder Visible").clicked() {
+                                        self.confirm_action = None;
+                                    }
+                                });
                             }
-                            let confirm_label = match action {
-                                ConfirmAction::Lock => "Lock",
-                                ConfirmAction::Unlock => "Unlock",
-                                ConfirmAction::Remove => "Remove",
-                            };
-                            if ui.button(confirm_label).clicked() {
+                            _ => {
+                                let item_desc = if let Some(&i) = self.selected.iter().next() {
+                                    self.items.get(i)
+                                        .map(|it| format!("{}", it.original_path.display()))
+                                        .unwrap_or_else(|| "<none>".to_string())
+                                } else {
+                                    "<none>".to_string()
+                                };
                                 match action {
-                                    ConfirmAction::Lock => self.lock_selected(),
-                                    ConfirmAction::Unlock => self.unlock_selected(),
-                                    ConfirmAction::Remove => self.remove_selected(),
-                                }
-                                self.confirm_action = None;
+                                    ConfirmAction::Lock => ui.label("This will encrypt and hide the selected item."),
+                                    ConfirmAction::Unlock => ui.label("This will decrypt and restore the selected item."),
+                                    ConfirmAction::Remove => ui.label("This removes the item from the list only; it does not delete files."),
+                                    ConfirmAction::HideFolderWithFailures { .. } => unreachable!(),
+                                };
+                                ui.label(format!("Item: {}",
+                                    item_desc
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        self.confirm_action = None;
+                                    }
+                                    let confirm_label = match action {
+                                        ConfirmAction::Lock => "Lock",
+                                        ConfirmAction::Unlock => "Unlock",
+                                        ConfirmAction::Remove => "Remove",
+                                        ConfirmAction::HideFolderWithFailures { .. } => unreachable!(),
+                                    };
+                                    if ui.button(confirm_label).clicked() {
+                                        match action {
+                                            ConfirmAction::Lock => self.lock_selected(),
+                                            ConfirmAction::Unlock => self.unlock_selected(),
+                                            ConfirmAction::Remove => self.remove_selected(),
+                                            ConfirmAction::HideFolderWithFailures { .. } => unreachable!(),
+                                        }
+                                        self.confirm_action = None;
+                                    }
+                                });
                             }
-                        });
+                        }
                     });
             }
         }
@@ -1992,4 +2205,9 @@ enum ConfirmAction {
     Lock,
     Unlock,
     Remove,
+    HideFolderWithFailures {
+        folder_indices: Vec<usize>,
+        total_files: usize,
+        failed_files: usize,
+    },
 }

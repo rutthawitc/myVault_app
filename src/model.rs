@@ -14,5 +14,6 @@ pub struct VaultItem {
     pub encrypted_path: Option<PathBuf>,
     pub is_locked: bool,
     pub item_type: ItemType,
+    pub is_folder_hidden: bool,
 }
 

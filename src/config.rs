@@ -59,6 +59,8 @@ pub struct ConfigItem {
     pub encrypted_path: Option<String>,
     pub is_locked: bool,
     pub item_type: ItemType,
+    #[serde(default)]
+    pub is_folder_hidden: bool,
 }
 
 impl From<&VaultItem> for ConfigItem {
@@ -71,6 +73,7 @@ impl From<&VaultItem> for ConfigItem {
                 .map(|p| p.to_string_lossy().into_owned()),
             is_locked: v.is_locked,
             item_type: v.item_type,
+            is_folder_hidden: v.is_folder_hidden,
         }
     }
 }
@@ -82,6 +85,7 @@ impl From<&ConfigItem> for VaultItem {
             encrypted_path: c.encrypted_path.as_ref().map(PathBuf::from),
             is_locked: c.is_locked,
             item_type: c.item_type,
+            is_folder_hidden: c.is_folder_hidden,
         }
     }
 }

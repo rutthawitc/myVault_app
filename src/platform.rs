@@ -61,10 +61,57 @@ pub fn unhide(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+// macOS implementation using chflags command
+#[cfg(target_os = "macos")]
+pub fn hide(path: &Path) -> io::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("chflags")
+        .arg("hidden")
+        .arg(path)
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("chflags failed: {}", String::from_utf8_lossy(&output.stderr))
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn unhide(path: &Path) -> io::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("chflags")
+        .arg("nohidden")
+        .arg(path)
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("chflags failed: {}", String::from_utf8_lossy(&output.stderr))
+        ))
+    }
+}
+
+// Linux implementation (no-op for now, could add dotfile prefix in future)
+#[cfg(target_os = "linux")]
 pub fn hide(_path: &Path) -> io::Result<()> { Ok(()) }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub fn unhide(_path: &Path) -> io::Result<()> { Ok(()) }
+
+// Fallback for other platforms
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+pub fn hide(_path: &Path) -> io::Result<()> { Ok(()) }
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn unhide(_path: &Path) -> io::Result<()> { Ok(()) }
 
 /// Get the platform identifier
