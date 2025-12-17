@@ -22,7 +22,7 @@ use model::{ItemType, VaultItem};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::collections::{VecDeque, HashSet};
+use std::collections::{VecDeque, HashSet, BTreeMap};
 use std::time::{Instant, SystemTime};
 
 fn main() -> eframe::Result<()> {
@@ -421,12 +421,24 @@ impl MyVaultApp {
     fn scan_locked_files(&mut self, folder: &Path) {
         // Recursively scan a folder for encrypted files and add them to the vault
         let mut found_count = 0;
+        let mut skipped_count = 0;
+        let mut total_scanned = 0;
+        let mut error_count = 0;
 
         for entry in WalkDir::new(folder)
             .into_iter()
-            .filter_map(Result::ok)
+            .filter_map(|e| {
+                match e {
+                    Ok(entry) => Some(entry),
+                    Err(_) => {
+                        error_count += 1;
+                        None
+                    }
+                }
+            })
             .filter(|e| e.file_type().is_file())
         {
+            total_scanned += 1;
             let file_path = entry.path();
             // Check if it's a MyVault encrypted file
             if crate::crypto::is_encrypted_file(file_path) {
@@ -437,7 +449,9 @@ impl MyVaultApp {
                         item.encrypted_path.as_ref().map(|p| p == file_path).unwrap_or(false)
                     });
 
-                    if !already_added {
+                    if already_added {
+                        skipped_count += 1;
+                    } else {
                         // Add as locked file
                         let item = VaultItem {
                             original_path: original,
@@ -455,9 +469,27 @@ impl MyVaultApp {
 
         if found_count > 0 {
             self.save_config();
-            self.status_message = format!("Found and added {} locked files", found_count);
+            if skipped_count > 0 || error_count > 0 {
+                self.status_message = format!(
+                    "Scan complete: Added {} new files, skipped {} duplicates ({} total scanned, {} errors)",
+                    found_count, skipped_count, total_scanned, error_count
+                );
+            } else {
+                self.status_message = format!(
+                    "Found and added {} locked files ({} total scanned)",
+                    found_count, total_scanned
+                );
+            }
+        } else if skipped_count > 0 {
+            self.status_message = format!(
+                "Scanned {} files - all {} encrypted files already in vault",
+                total_scanned, skipped_count
+            );
         } else {
-            self.status_message = "No locked files found in folder".to_string();
+            self.status_message = format!(
+                "Scanned {} files - no locked files found",
+                total_scanned
+            );
         }
     }
 
@@ -1353,64 +1385,131 @@ impl eframe::App for MyVaultApp {
                 }
             });
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // Show message if filtering resulted in empty list
-                if display_items.is_empty() && !self.items.is_empty() {
-                    ui.label("No items match the search filter");
-                } else if self.items.is_empty() {
-                    ui.label("No files added yet. Use buttons above or drag & drop files here.");
-                }
+            // Group items by parent directory
+            let mut groups: BTreeMap<PathBuf, Vec<(usize, &VaultItem)>> = BTreeMap::new();
+            for item in &display_items {
+                let parent = item.1.original_path.parent()
+                    .unwrap_or(Path::new("/"))
+                    .to_path_buf();
+                groups.entry(parent).or_insert_with(Vec::new).push(*item);
+            }
 
-                for (idx, item) in display_items.iter() {
-                    let is_selected = self.selected.contains(idx);
-                    let file_size = format_file_size(&item.original_path);
-                    let label = format!(
-                        "{}  {}  {}  {} {}",
-                        match item.item_type { ItemType::File => "[F]", ItemType::Folder => "[D]" },
-                        item.original_path.display(),
-                        file_size,
-                        if item.is_locked { "Locked" } else { "Unlocked" },
-                        if item.is_locked { "🔒" } else { "🔓" }
-                    );
-
-                    // Color locked items in red for easy visual distinction
-                    let label_text = if item.is_locked {
-                        egui::RichText::new(label).color(egui::Color32::from_rgb(220, 50, 50))
-                    } else {
-                        egui::RichText::new(label)
+            // Sort files within each folder group
+            for (_, items) in groups.iter_mut() {
+                items.sort_by(|(_, a), (_, b)| {
+                    let ordering = match self.sort_by {
+                        SortField::Name => {
+                            a.original_path.file_name().unwrap_or_default()
+                                .to_string_lossy()
+                                .cmp(&b.original_path.file_name().unwrap_or_default().to_string_lossy())
+                        }
+                        SortField::Status => {
+                            a.is_locked.cmp(&b.is_locked)
+                        }
+                        SortField::Size => {
+                            let size_a = std::fs::metadata(&a.original_path).map(|m| m.len()).unwrap_or(0);
+                            let size_b = std::fs::metadata(&b.original_path).map(|m| m.len()).unwrap_or(0);
+                            size_a.cmp(&size_b)
+                        }
                     };
+                    if self.sort_ascending {
+                        ordering
+                    } else {
+                        ordering.reverse()
+                    }
+                });
+            }
 
-                    // Multi-select with Ctrl+click and Shift+click for range selection
-                    if ui.selectable_label(is_selected, label_text).clicked() {
-                        let modifiers = ui.ctx().input(|i| i.modifiers);
-                        if modifiers.shift {
-                            // Range select with Shift held
-                            if let Some(last) = self.last_selected {
-                                let start = last.min(*idx);
-                                let end = last.max(*idx);
-                                for j in start..=end {
-                                    self.selected.insert(j);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    // Show message if filtering resulted in empty list
+                    if display_items.is_empty() && !self.items.is_empty() {
+                        ui.label("No items match the search filter");
+                    } else if self.items.is_empty() {
+                        ui.label("No files added yet. Use buttons above or drag & drop files here.");
+                    }
+
+                    // Render grouped file list
+                    for (parent_dir, items) in groups.iter() {
+                        // Check if all files in this folder are selected
+                        let all_selected = !items.is_empty() && items.iter().all(|(idx, _)| self.selected.contains(idx));
+                        let folder_header_label = egui::RichText::new(format!("📁 {}", parent_dir.display())).strong();
+
+                        // Make folder header clickable to select/deselect entire folder
+                        if ui.selectable_label(all_selected, folder_header_label).clicked() {
+                            // Toggle selection of all files in this folder
+                            if all_selected {
+                                // Deselect all files in this folder
+                                for (idx, _) in items.iter() {
+                                    self.selected.remove(idx);
                                 }
                             } else {
-                                self.selected.insert(*idx);
+                                // Select all files in this folder
+                                for (idx, _) in items.iter() {
+                                    self.selected.insert(*idx);
+                                }
                             }
-                            self.last_selected = Some(*idx);
-                        } else if modifiers.ctrl {
-                            // Toggle with Ctrl held
-                            if is_selected {
-                                self.selected.remove(idx);
-                            } else {
-                                self.selected.insert(*idx);
-                            }
-                            self.last_selected = Some(*idx);
-                        } else {
-                            // Single select without modifiers
-                            self.selected.clear();
-                            self.selected.insert(*idx);
-                            self.last_selected = Some(*idx);
                         }
+
+                        // Render files under this folder (indented)
+                        for (idx, item) in items.iter() {
+                            let is_selected = self.selected.contains(idx);
+                            let file_name = item.original_path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
+                            let file_size = format_file_size(&item.original_path);
+                            let label = format!(
+                                "     {}  {}  {}  {} {}",
+                                match item.item_type { ItemType::File => "└", ItemType::Folder => "📁" },
+                                file_name,
+                                file_size,
+                                if item.is_locked { "Locked" } else { "Unlocked" },
+                                if item.is_locked { "🔒" } else { "🔓" }
+                            );
+
+                            // Color locked items in red for easy visual distinction
+                            let label_text = if item.is_locked {
+                                egui::RichText::new(label).color(egui::Color32::from_rgb(220, 50, 50))
+                            } else {
+                                egui::RichText::new(label)
+                            };
+
+                            // Multi-select with Ctrl+click and Shift+click for range selection
+                            if ui.selectable_label(is_selected, label_text).clicked() {
+                                let modifiers = ui.ctx().input(|i| i.modifiers);
+                                if modifiers.shift {
+                                    // Range select with Shift held
+                                    if let Some(last) = self.last_selected {
+                                        let start = last.min(*idx);
+                                        let end = last.max(*idx);
+                                        for j in start..=end {
+                                            self.selected.insert(j);
+                                        }
+                                    } else {
+                                        self.selected.insert(*idx);
+                                    }
+                                    self.last_selected = Some(*idx);
+                                } else if modifiers.ctrl {
+                                    // Toggle with Ctrl held
+                                    if is_selected {
+                                        self.selected.remove(idx);
+                                    } else {
+                                        self.selected.insert(*idx);
+                                    }
+                                    self.last_selected = Some(*idx);
+                                } else {
+                                    // Single select without modifiers
+                                    self.selected.clear();
+                                    self.selected.insert(*idx);
+                                    self.last_selected = Some(*idx);
+                                }
+                            }
+                        }
+
+                        ui.add_space(8.0);  // Space between folder groups
                     }
-                }
             });
 
             ui.set_enabled(true);  // Re-enable for rest of UI

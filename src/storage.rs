@@ -232,11 +232,6 @@ impl StorageInfo {
         }
     }
 
-    /// Not applicable for other platforms in this MVP
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    fn is_network_mount(_path: &Path) -> bool {
-        false
-    }
 }
 
 impl std::fmt::Display for StorageInfo {

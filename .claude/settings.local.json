@@ -16,7 +16,12 @@
       "Bash(git commit:*)",
       "WebFetch(domain:github.com)",
       "Bash(cargo test:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(cargo install:*)",
+      "Bash(cargo bundle:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo run:*)",
+      "Bash(pkill:*)"
     ],
     "deny": [],
     "ask": []

@@ -27,3 +27,12 @@ dirs = "5.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winnt", "fileapi", "winbase", "winuser", "shellapi"] }
+
+[package.metadata.bundle]
+name = "My Vault"
+identifier = "com.myvault.app"
+version = "1.0.0"
+category = "Utility"
+short_description = "Secure file encryption"
+long_description = "A secure file encryption application with military-grade cryptography (ChaCha20-Poly1305)"
+icon = ["resources/icon.icns"]
