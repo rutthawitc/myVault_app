@@ -58,8 +58,8 @@ The application follows a **layered, modular architecture**:
 | Module | Purpose | Key Details |
 |--------|---------|------------|
 | **main.rs** | UI & Application State | egui event loop, batch operations, file list management |
-| **crypto.rs** | Encryption/Decryption | ChaCha20-Poly1305 streaming (chunks), STREAM construction, roundtrip tests |
-| **config.rs** | JSON Persistence | Vault items, UI preferences, security settings storage |
+| **crypto.rs** | Encryption/Decryption | ChaCha20-Poly1305 streaming (chunks), envelope encryption (DEK/KEK), V3 authenticated framing |
+| **config.rs** | JSON Persistence | Vault items, wrapped DEK, UI preferences, security settings |
 | **performance.rs** | Thread Sizing | CPU core detection, worker-thread count |
 | **platform.rs** | Platform-Specific APIs | File attributes (Windows), config directory paths (cross-platform) |
 | **model.rs** | Data Structures | VaultItem, ItemType enums, serialization |
@@ -69,8 +69,9 @@ The application follows a **layered, modular architecture**:
 1. **Chunked Streaming**: Files processed in 16MB chunks to ensure O(1) memory regardless of file size
 2. **Bounded Parallelism**: Max 4 worker threads, one file per thread (prevents memory exhaustion)
 3. **Channel-Based Threading**: Background threads communicate via `mpsc` channels; UI stays responsive
+4. **Envelope Encryption**: A random Data Encryption Key encrypts files; the master password only wraps it, so a password change never orphans existing files
 5. **Configuration Persistence**: `vault_config.json` stored in platform-specific app directories
-6. **Secure Memory Handling**: All sensitive data (passwords, keys) explicitly zeroed using `zeroize` crate
+6. **Secure Memory Handling**: All sensitive data (passwords, keys) explicitly zeroed using `zeroize` crate; the file key lives in a self-wiping `SecretKey`
 
 ## Critical Constraints & Requirements
 
@@ -83,7 +84,22 @@ The application follows a **layered, modular architecture**:
 - **Never derive the file key from the password directly.** Files are encrypted with the
   Data Encryption Key; the password-derived key only wraps it. Breaking this makes a
   password change destroy every existing encrypted file.
+- **File formats**: V3 is the only format written. V1 and V2 are read-only for backward
+  compatibility — never add a new code path that writes them.
 - **Durability**: `sync_all()` the output before the caller deletes the source file.
+- **Untrusted input**: Any length or offset read out of a file must be bounds-checked
+  before it is used to allocate.
+
+### File Format (V3)
+
+```
+[HEADER_V3(10)][MASTER_NONCE(24)][CHUNK...]
+chunk = [FLAGS(1)][LENGTH(8)][CIPHERTEXT+TAG]
+```
+
+Each chunk's AAD binds the header, the chunk index and the flags byte, so reordering,
+splicing and truncation all fail authentication. The last chunk carries `FLAG_FINAL`;
+decryption fails if it is never seen.
 
 ### Performance & Parallelism
 - **Max worker threads**: Hard limit of 4 threads (prevents memory exhaustion during batch operations)
@@ -135,9 +151,10 @@ The application follows a **layered, modular architecture**:
 | Batch operation thread spawning | `MyVaultApp::update` in `src/main.rs` (the `current_op` block) |
 | Streaming encryption / decryption | `crypto::encrypt_file_streaming` / `crypto::decrypt_file_streaming` |
 | Legacy format reading (V1) | `crypto::decrypt_file_streaming_v1` |
-| Worker-thread count | `src/performance.rs` |
+| Chunk nonce + authenticated framing | `crypto::derive_chunk_nonce` / `crypto::chunk_aad` |
 | Envelope encryption (DEK/KEK) | `crypto::wrap_dek` / `crypto::unwrap_dek` |
 | Vault key lifecycle | `MyVaultApp::create_vault_key` / `unlock_vault_key` / `rewrap_vault_key` |
+| Worker-thread count | `src/performance.rs` |
 | Configuration saving / loading | `config::save_config` / `config::load_config` |
 | Encrypted filename mapping | `MyVaultApp::encrypted_path_for` / `original_path_for` |
 | Crypto test cases | `mod tests` at the end of `src/crypto.rs` |

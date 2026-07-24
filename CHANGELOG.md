@@ -12,9 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Envelope encryption (DEK/KEK).** Files are now encrypted with a random Data
   Encryption Key that never changes. The master password only wraps that key.
   Changing the master password re-wraps the same key instead of deriving a new
-  one - previously this permanently orphaned every already-encrypted file.
+  one — previously this permanently orphaned every already-encrypted file.
   Existing vaults are migrated automatically on the next successful login, and
   files encrypted before the change remain readable.
+- **File format V3** with authenticated chunk framing. Each chunk is bound to its
+  index and to an end-of-file marker via AEAD additional data, so truncating,
+  reordering or splicing chunks is now detected instead of silently producing
+  partial plaintext. V1 and V2 files are still readable.
+- Chunk lengths read from a file are bounded before allocating, so a corrupted or
+  malicious file can no longer trigger a huge allocation.
+- The encryption key is wiped from memory when the vault is locked, on session
+  timeout, and when a worker thread finishes.
 
 ### Fixed
 
@@ -25,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `vault_config.json` is fsynced before the atomic rename.
 - A corrupted `vault_config.json` is no longer silently replaced with defaults
   (which discarded the key material). It is backed up and reported instead.
+- The UI no longer sleeps 5ms on its own thread for every file queued in a batch
+  operation, which made the interface stutter on large batches.
 
 ### Changed
 
@@ -32,15 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config::save_config` takes a single `&Config` instead of a long positional
   argument list, so adding a setting no longer changes its signature.
 
-### Fixed
-
-- The UI no longer sleeps 5ms on its own thread for every file queued in a batch
-  operation, which made the interface stutter on large batches.
-
 ### Removed
 
 - Deleted unused modules `storage.rs`, `prefetch.rs`, `throughput.rs` and
-  `progress.rs` (~1,250 lines) - none were reachable from the application.
+  `progress.rs` (~1,250 lines) — none were reachable from the application.
   `performance.rs` is trimmed to the CPU/thread detection that is actually used.
 - Deleted the unused parallel encryption path (`encrypt_file_parallel` /
   `decrypt_file_parallel`) and the unused `encrypt_blob` / `decrypt_blob` helpers.

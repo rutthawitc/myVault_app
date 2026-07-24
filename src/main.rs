@@ -93,7 +93,7 @@ struct MyVaultApp {
     /// The Data Encryption Key, unwrapped in memory while the vault is unlocked.
     /// It is independent of the master password, so changing the password does
     /// not invalidate previously encrypted files.
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<crypto::SecretKey>,
     wrapped_dek: Option<String>,
     confirm_action: Option<ConfirmAction>,
     current_op: Option<BatchOp>,
@@ -203,7 +203,7 @@ impl MyVaultApp {
         kek.zeroize();
 
         self.wrapped_dek = Some(wrapped?);
-        self.encryption_key = Some(dek);
+        self.encryption_key = Some(crypto::SecretKey::new(dek));
         Ok(())
     }
 
@@ -230,7 +230,7 @@ impl MyVaultApp {
         kek.zeroize();
 
         let (dek, newly_wrapped) = outcome?;
-        self.encryption_key = Some(dek);
+        self.encryption_key = Some(crypto::SecretKey::new(dek));
 
         if let Some(w) = newly_wrapped {
             self.wrapped_dek = Some(w);
@@ -246,9 +246,11 @@ impl MyVaultApp {
     fn rewrap_vault_key(&mut self, new_password: &str, new_salt: &str) -> Result<(), String> {
         let dek = self
             .encryption_key
-            .ok_or("Vault is locked - unlock it before changing the master password")?;
+            .as_ref()
+            .ok_or("Vault is locked - unlock it before changing the master password")?
+            .clone();
         let mut kek = crypto::derive_key(new_password, new_salt)?;
-        let wrapped = crypto::wrap_dek(&kek, &dek);
+        let wrapped = crypto::wrap_dek(&kek, dek.as_bytes());
         kek.zeroize();
 
         self.wrapped_dek = Some(wrapped?);
@@ -940,8 +942,10 @@ impl eframe::App for MyVaultApp {
             while self.op_result_rxs.len() < max_parallel && !op.queue.is_empty() {
                 let Some(p) = op.queue.pop_front() else { break };
 
+                // Each worker gets its own handle to the key; it is wiped when the
+                // worker thread finishes.
                 let key = match &self.encryption_key {
-                    Some(k) => *k,
+                    Some(k) => k.clone(),
                     None => {
                         op.failures += 1;
                         self.current_op = Some(op);
@@ -978,7 +982,7 @@ impl eframe::App for MyVaultApp {
                             // Use streaming encryption for all files to prevent memory exhaustion
                             // when processing many files in parallel. Streaming is memory-safe and
                             // provides good performance with the optimized 16MB chunks.
-                            let encrypt_result = crate::crypto::encrypt_file_streaming(&key, &p, &out);
+                            let encrypt_result = crate::crypto::encrypt_file_streaming(key.as_bytes(), &p, &out);
 
                             match encrypt_result {
                                 Ok(_) => {
@@ -999,7 +1003,7 @@ impl eframe::App for MyVaultApp {
                                     // Use streaming decryption for all files to prevent memory exhaustion
                                     // when processing many files in parallel. Streaming is memory-safe and
                                     // provides good performance with optimized chunk sizes.
-                                    let decrypt_result = crate::crypto::decrypt_file_streaming(&key, &p, &out);
+                                    let decrypt_result = crate::crypto::decrypt_file_streaming(key.as_bytes(), &p, &out);
 
                                     match decrypt_result {
                                         Ok(_) => {
@@ -1349,7 +1353,8 @@ impl eframe::App for MyVaultApp {
 
             ui.separator();
 
-            // Dim the files list if not authenticated
+            // Dim the files list if not authenticated. `disable()` applies to
+            // everything added to this Ui from here on.
             let enabled = self.authenticated;
             if !enabled {
                 ui.disable();
