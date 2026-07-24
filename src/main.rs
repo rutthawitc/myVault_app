@@ -5,16 +5,8 @@ mod crypto;
 mod model;
 mod platform;
 mod performance;
-mod storage;
-mod prefetch;
-mod throughput;
-mod progress;
 
-pub use performance::PerformanceConfig;
-pub use storage::{StorageInfo, StorageType};
-pub use prefetch::{Prefetcher, PrefetchConfig, PrefetchedChunk, ReadAheadQueue};
-pub use throughput::{ThroughputMonitor, AdaptiveController};
-pub use progress::{ProgressTracker, ProgressState, ProgressManager};
+use performance::PerformanceConfig;
 
 use eframe::egui;
 use zeroize::Zeroize;
@@ -34,7 +26,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "My Vault App",
         options,
-        Box::new(|_cc| Box::new(MyVaultApp::new())),
+        Box::new(|_cc| Ok(Box::new(MyVaultApp::new()))),
     )
 }
 
@@ -195,52 +187,6 @@ impl MyVaultApp {
         app
     }
 
-    #[allow(dead_code)]
-    fn perform_overwrite_lock(&mut self, src: &Path, dst: &Path) -> Result<(), String> {
-        let key = self.encryption_key.as_ref().ok_or("Not authenticated")?;
-        let data = std::fs::read(src).map_err(|e| e.to_string())?;
-        let blob = crate::crypto::encrypt_blob(key, &data)?;
-        std::fs::write(dst, blob).map_err(|e| e.to_string())?;
-        let _ = crate::platform::hide(dst);
-        std::fs::remove_file(src).map_err(|e| e.to_string())?;
-        // Update all matching items
-        for item in self.items.iter_mut() {
-            if item.original_path == src {
-                item.encrypted_path = Some(dst.to_path_buf());
-                item.is_locked = true;
-            }
-        }
-        // Phase 3: Track in recent files
-        self.add_to_recent_files(src.to_path_buf());
-        self.save_config();
-        self.status_message = "Locked file (overwritten)".to_string();
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn perform_overwrite_unlock(&mut self, src_enc: &Path, dst: &Path) -> Result<(), String> {
-        let key = self.encryption_key.as_ref().ok_or("Not authenticated")?;
-        let _ = crate::platform::unhide(src_enc);
-        let data = std::fs::read(src_enc).map_err(|e| e.to_string())?;
-        let plain = crate::crypto::decrypt_blob(key, &data)?;
-        std::fs::write(dst, plain).map_err(|e| e.to_string())?;
-        std::fs::remove_file(src_enc).map_err(|e| e.to_string())?;
-        // Update all matching items
-        for item in self.items.iter_mut() {
-            let expected_enc = item.encrypted_path.clone().unwrap_or_else(|| Self::encrypted_path_for(&item.original_path));
-            if expected_enc == src_enc {
-                item.encrypted_path = None;
-                item.is_locked = false;
-                item.original_path = dst.to_path_buf();
-            }
-        }
-        // Phase 3: Track in recent files
-        self.add_to_recent_files(dst.to_path_buf());
-        self.save_config();
-        self.status_message = "Unlocked file (overwritten)".to_string();
-        Ok(())
-    }
-
     fn load_from_config(&mut self) {
         match config::load_config() {
             Ok(cfg) => {
@@ -304,20 +250,22 @@ impl MyVaultApp {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        if let Err(e) = config::save_config(
-            &self.items,
-            self.master_password_hash.as_deref(),
-            self.salt.as_deref(),
-            self.dark_mode,
-            sort_by_str,
-            self.sort_ascending,
-            &recent_files_strings,
-            self.session_timeout_minutes,
-            self.auto_lock_enabled,
-            self.password_change_reminder_days,
-            password_timestamp,
-            reminder_timestamp,
-        ) {
+        let cfg = config::Config {
+            master_password_hash: self.master_password_hash.clone(),
+            salt: self.salt.clone(),
+            vault_items: self.items.iter().map(config::ConfigItem::from).collect(),
+            dark_mode: self.dark_mode,
+            sort_by: sort_by_str.to_string(),
+            sort_ascending: self.sort_ascending,
+            recent_files: recent_files_strings,
+            session_timeout_minutes: self.session_timeout_minutes,
+            auto_lock_enabled: self.auto_lock_enabled,
+            password_change_reminder_days: self.password_change_reminder_days,
+            password_last_changed: password_timestamp,
+            reminder_dismissed_until: reminder_timestamp,
+        };
+
+        if let Err(e) = config::save_config(&cfg) {
             self.status_message = format!("Failed to save config: {}", e);
         }
     }
@@ -851,11 +799,10 @@ impl eframe::App for MyVaultApp {
                 }
 
                 // Delete: Remove selected items
-                if i.key_pressed(egui::Key::Delete) {
-                    if !self.selected.is_empty() {
+                if i.key_pressed(egui::Key::Delete)
+                    && !self.selected.is_empty() {
                         self.confirm_action = Some(ConfirmAction::Remove);
                     }
-                }
 
                 // Escape: Clear selection
                 if i.key_pressed(egui::Key::Escape) {
@@ -984,17 +931,16 @@ impl eframe::App for MyVaultApp {
                                     }
                                 }
                             } else {
-                                (false, Some(format!("Invalid encrypted filename")))
+                                (false, Some("Invalid encrypted filename".to_string()))
                             }
                         }
                     };
                     let _ = result_tx.send((p_clone, res.0, res.1));
                 });
 
-                // Yield to allow OS to clean up file handles between operations
-                // Prevents file descriptor exhaustion on large batch operations (99+ files)
-                std::thread::sleep(std::time::Duration::from_millis(5));
-
+                // No artificial delay here: the number of in-flight workers is already
+                // bounded by `max_parallel` (<= 4), so file descriptors cannot pile up.
+                // Sleeping on the UI thread would freeze the interface for each spawn.
                 op.processed += 1;
                 self.op_result_rxs.push(result_rx);
             }
@@ -1116,11 +1062,10 @@ impl eframe::App for MyVaultApp {
                     self.show_password_dialog = true;
                 }
                 // Add Change Password button (only show if password is already set and authenticated)
-                if self.master_password_hash.is_some() && self.authenticated {
-                    if ui.button("Change Password").clicked() {
+                if self.master_password_hash.is_some() && self.authenticated
+                    && ui.button("Change Password").clicked() {
                         self.show_change_password_dialog = true;
                     }
-                }
                 ui.separator();
                 // Phase 1: Dark mode toggle
                 let theme_label = if self.dark_mode { "☀ Light Mode" } else { "🌙 Dark Mode" };
@@ -1154,7 +1099,7 @@ impl eframe::App for MyVaultApp {
                             {
                                 let item_type = if path.is_dir() { ItemType::Folder } else { ItemType::File };
                                 self.add_path(path.clone(), item_type);
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     }
@@ -1325,7 +1270,9 @@ impl eframe::App for MyVaultApp {
 
             // Dim the files list if not authenticated
             let enabled = self.authenticated;
-            ui.set_enabled(enabled);
+            if !enabled {
+                ui.disable();
+            }
 
             // Show placeholder message if not authenticated
             if !enabled {
@@ -1391,7 +1338,7 @@ impl eframe::App for MyVaultApp {
                 let parent = item.1.original_path.parent()
                     .unwrap_or(Path::new("/"))
                     .to_path_buf();
-                groups.entry(parent).or_insert_with(Vec::new).push(*item);
+                groups.entry(parent).or_default().push(*item);
             }
 
             // Sort files within each folder group
@@ -1512,7 +1459,6 @@ impl eframe::App for MyVaultApp {
                     }
             });
 
-            ui.set_enabled(true);  // Re-enable for rest of UI
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -1609,11 +1555,10 @@ impl eframe::App for MyVaultApp {
 
                         ui.horizontal(|ui| {
                             // Phase 3: Password generator button (only for password creation, not authentication)
-                            if !has_hash {
-                                if ui.button("🔐 Generate").on_hover_text("Open password generator").clicked() {
+                            if !has_hash
+                                && ui.button("🔐 Generate").on_hover_text("Open password generator").clicked() {
                                     self.show_password_generator = true;
                                 }
-                            }
 
                             if ui.button("Cancel").clicked() {
                                 self.show_password_dialog = false;
@@ -1626,32 +1571,29 @@ impl eframe::App for MyVaultApp {
                             if has_hash {
                                 // Trigger authentication on button click OR Enter key
                                 if ui.button("Enter").clicked() || enter_pressed {
-                                    match (&self.master_password_hash).as_deref() {
-                                        Some(hash) => match crypto::verify_password(&self.temp_password, hash) {
-                                            Ok(true) => {
-                                                // derive session key
-                                                if let Some(salt) = &self.salt {
-                                                    match crypto::derive_key(&self.temp_password, salt) {
-                                                        Ok(k) => { self.encryption_key = Some(k); }
-                                                        Err(e) => { self.status_message = format!("Key derivation error: {}", e); }
-                                                    }
+                                    if let Some(hash) = self.master_password_hash.as_deref() { match crypto::verify_password(&self.temp_password, hash) {
+                                        Ok(true) => {
+                                            // derive session key
+                                            if let Some(salt) = &self.salt {
+                                                match crypto::derive_key(&self.temp_password, salt) {
+                                                    Ok(k) => { self.encryption_key = Some(k); }
+                                                    Err(e) => { self.status_message = format!("Key derivation error: {}", e); }
                                                 }
-                                                self.authenticated = true;
-                                                self.status_message = "Authenticated".to_string();
-                                                self.show_password_dialog = false;
+                                            }
+                                            self.authenticated = true;
+                                            self.status_message = "Authenticated".to_string();
+                                            self.show_password_dialog = false;
 
-                                                // Phase 3: Check if password change reminder should be shown
-                                                self.check_password_reminder();
-                                            }
-                                            Ok(false) => {
-                                                self.status_message = "Invalid password".to_string();
-                                            }
-                                            Err(e) => {
-                                                self.status_message = format!("Password verification error: {}", e);
-                                            }
-                                        },
-                                        None => {}
-                                    }
+                                            // Phase 3: Check if password change reminder should be shown
+                                            self.check_password_reminder();
+                                        }
+                                        Ok(false) => {
+                                            self.status_message = "Invalid password".to_string();
+                                        }
+                                        Err(e) => {
+                                            self.status_message = format!("Password verification error: {}", e);
+                                        }
+                                    } }
                                     self.temp_password.zeroize();
                                     self.temp_password.clear();
                                 }
@@ -1888,14 +1830,13 @@ impl eframe::App for MyVaultApp {
                     ui.separator();
 
                     // Manual Lock button
-                    if self.authenticated {
-                        if ui.button("🔒 Lock Now").clicked() {
+                    if self.authenticated
+                        && ui.button("🔒 Lock Now").clicked() {
                             self.authenticated = false;
                             self.encryption_key = None;
                             self.status_message = "🔒 Session locked manually".to_string();
                             self.show_settings_dialog = false;
                         }
-                    }
 
                     ui.separator();
 
@@ -2309,4 +2250,67 @@ enum ConfirmAction {
         total_files: usize,
         failed_files: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The encrypted-name logic is platform-dependent (a leading dot hides the
+    /// file on Unix) and is the only thing that maps a locked file back to its
+    /// original name. A mismatch here silently makes files impossible to unlock.
+    fn assert_roundtrip(original: &str) {
+        let path = PathBuf::from(original);
+        let encrypted = MyVaultApp::encrypted_path_for(&path);
+
+        assert_ne!(encrypted, path, "Encrypted name must differ from the original");
+        assert!(
+            encrypted
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(MyVaultApp::encrypted_suffix()),
+            "Encrypted name must carry the vault suffix"
+        );
+
+        let recovered = MyVaultApp::original_path_for(&encrypted)
+            .unwrap_or_else(|| panic!("Could not map {} back to its original name", original));
+        assert_eq!(recovered, path, "Round-trip must recover the original path");
+    }
+
+    #[test]
+    fn test_path_roundtrip_plain_name() {
+        assert_roundtrip("report.pdf");
+    }
+
+    #[test]
+    fn test_path_roundtrip_in_directory() {
+        assert_roundtrip("/tmp/vault/report.pdf");
+    }
+
+    #[test]
+    fn test_path_roundtrip_no_extension() {
+        assert_roundtrip("/tmp/vault/README");
+    }
+
+    #[test]
+    fn test_path_roundtrip_multiple_dots() {
+        assert_roundtrip("/tmp/vault/archive.tar.gz");
+    }
+
+    /// Files that already start with a dot are the tricky case: the Unix branch
+    /// adds one more dot and must remove exactly one on the way back.
+    #[test]
+    fn test_path_roundtrip_dotfile() {
+        assert_roundtrip("/tmp/vault/.env");
+    }
+
+    #[test]
+    fn test_original_path_rejects_non_vault_name() {
+        let plain = PathBuf::from("/tmp/vault/notes.txt");
+        assert!(
+            MyVaultApp::original_path_for(&plain).is_none(),
+            "A file without the vault suffix has no original name"
+        );
+    }
 }

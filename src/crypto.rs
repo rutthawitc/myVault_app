@@ -3,7 +3,6 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use password_hash::{rand_core::OsRng, SaltString};
 use rand::RngCore;
-use rayon::prelude::*;
 
 pub fn hash_password(password: &str) -> Result<(String, String), String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -61,43 +60,6 @@ pub fn is_encrypted_file(path: &std::path::Path) -> bool {
     }
 }
 
-#[allow(dead_code)]
-pub fn encrypt_blob(key_bytes: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let key = Key::from(*key_bytes);
-    let cipher = ChaCha20Poly1305::new(&key);
-    let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-    let nonce_ref = Nonce::from(nonce);
-    let mut out = Vec::with_capacity(HEADER_V1.len() + NONCE_LEN + plaintext.len() + 16);
-    out.extend_from_slice(HEADER_V1);
-    out.extend_from_slice(&nonce);
-    let ciphertext = cipher
-        .encrypt(&nonce_ref, plaintext)
-        .map_err(|e| e.to_string())?;
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-#[allow(dead_code)]
-pub fn decrypt_blob(key_bytes: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
-    if data.len() < HEADER_V1.len() + NONCE_LEN + 16 {
-        return Err("ciphertext too short".to_string());
-    }
-    if &data[..HEADER_V1.len()] != HEADER_V1 {
-        return Err("invalid header".to_string());
-    }
-    let nonce_slice = &data[HEADER_V1.len()..HEADER_V1.len() + NONCE_LEN];
-    let ciphertext = &data[HEADER_V1.len() + NONCE_LEN..];
-    let key = Key::from(*key_bytes);
-    let cipher = ChaCha20Poly1305::new(&key);
-    let nonce_array = <[u8; NONCE_LEN]>::try_from(nonce_slice).map_err(|_| "invalid nonce".to_string())?;
-    let nonce_ref = Nonce::from(nonce_array);
-    let plaintext = cipher
-        .decrypt(&nonce_ref, ciphertext)
-        .map_err(|e| e.to_string())?;
-    Ok(plaintext)
-}
-
 /// Derive a unique nonce for each chunk using XOR with chunk index
 ///
 /// This implements the STREAM construction pattern where each chunk gets
@@ -112,9 +74,7 @@ fn derive_chunk_nonce(master: &[u8; MASTER_NONCE_LEN], index: u64) -> [u8; NONCE
     }
 
     // Keep remaining nonce bytes from master
-    for i in 8..NONCE_LEN {
-        nonce[i] = master[i];
-    }
+    nonce[8..NONCE_LEN].copy_from_slice(&master[8..NONCE_LEN]);
 
     nonce
 }
@@ -317,216 +277,6 @@ fn decrypt_file_streaming_v1(
     Ok(())
 }
 
-/// Encrypt a large file using parallel chunk processing
-///
-/// This function is optimized for large files (> 100MB) by:
-/// - Using memory-mapped I/O (zero-copy read)
-/// - Encrypting chunks in parallel using rayon
-/// - Reassembling encrypted chunks in order
-///
-/// # Arguments
-/// * `key_bytes` - 32-byte encryption key
-/// * `input_path` - Path to plaintext file
-/// * `output_path` - Path to write encrypted file
-/// * `num_threads` - Number of parallel threads to use
-///
-/// # Performance
-/// - 10GB file on 16-core CPU: ~4-5 seconds
-/// - Memory usage: constant (mmap handles paging)
-/// - CPU utilization: 90%+ across all threads
-#[allow(dead_code)]
-pub fn encrypt_file_parallel(
-    key_bytes: &[u8; 32],
-    input_path: &std::path::Path,
-    output_path: &std::path::Path,
-    num_threads: usize,
-) -> Result<(), String> {
-    use memmap2::Mmap;
-    use std::fs::File;
-    use std::io::Write;
-
-    // Open and memory-map the input file
-    let input_file = File::open(input_path).map_err(|e| e.to_string())?;
-    let mmap = unsafe {
-        Mmap::map(&input_file).map_err(|e| e.to_string())?
-    };
-    let file_size = mmap.len();
-
-    // Calculate chunk boundaries
-    let chunk_size = CHUNK_SIZE;
-    let chunk_count = (file_size + chunk_size - 1) / chunk_size;
-
-    // Generate master nonce for all chunks
-    let mut master_nonce = [0u8; MASTER_NONCE_LEN];
-    OsRng.fill_bytes(&mut master_nonce);
-
-    // Encrypt chunks in parallel using rayon
-    let results: Result<Vec<Vec<u8>>, String> = (0..chunk_count)
-        .into_par_iter()
-        .with_max_len(num_threads)
-        .map(|chunk_idx| {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(file_size);
-            let chunk_data = &mmap[start..end];
-
-            // Derive chunk-specific nonce
-            let chunk_nonce = derive_chunk_nonce(&master_nonce, chunk_idx as u64);
-
-            // Encrypt this chunk
-            let key = Key::from(*key_bytes);
-            let cipher = ChaCha20Poly1305::new(&key);
-            let nonce_ref = Nonce::from(chunk_nonce);
-
-            cipher
-                .encrypt(&nonce_ref, chunk_data)
-                .map_err(|e| e.to_string())
-        })
-        .collect();
-
-    let encrypted_chunks = results?;
-
-    // Write output file with buffered I/O (32MB buffer for safety)
-    use std::io::BufWriter;
-    let output_file = File::create(output_path).map_err(|e| e.to_string())?;
-    let mut output = BufWriter::with_capacity(32 * 1024 * 1024, output_file);
-
-    // Write header and master nonce
-    output.write_all(HEADER_V2).map_err(|e| e.to_string())?;
-    output.write_all(&master_nonce).map_err(|e| e.to_string())?;
-
-    // Write encrypted chunks in order (buffering reduces syscalls)
-    for ciphertext in encrypted_chunks {
-        output
-            .write_all(&(ciphertext.len() as u64).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        output
-            .write_all(&ciphertext)
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Flush buffer to ensure all data is written
-    output.flush().map_err(|e| e.to_string())?;
-
-    // Explicitly drop files to release OS resources immediately
-    drop(output);
-
-    Ok(())
-}
-
-/// Decrypt a large file using parallel chunk processing
-///
-/// This function is optimized for large encrypted files by:
-/// - Reading chunks sequentially (maintain order)
-/// - Decrypting chunks in parallel
-/// - Writing output sequentially
-///
-/// # Arguments
-/// * `key_bytes` - 32-byte decryption key
-/// * `input_path` - Path to encrypted file
-/// * `output_path` - Path to write decrypted file
-/// * `num_threads` - Number of parallel threads to use
-///
-/// # Performance
-/// - 10GB file on 16-core CPU: ~4-5 seconds
-/// - Memory usage: constant
-/// - CPU utilization: 90%+
-#[allow(dead_code)]
-pub fn decrypt_file_parallel(
-    key_bytes: &[u8; 32],
-    input_path: &std::path::Path,
-    output_path: &std::path::Path,
-    num_threads: usize,
-) -> Result<(), String> {
-    use std::fs::File;
-    use std::io::{Read, Write};
-
-    let mut input = File::open(input_path).map_err(|e| e.to_string())?;
-
-    // Read and validate header
-    let mut header_buf = vec![0u8; HEADER_V2.len()];
-    input.read_exact(&mut header_buf).map_err(|e| e.to_string())?;
-
-    if header_buf == HEADER_V1 {
-        // Old V1 format - use sequential decryption
-        drop(input);
-        return decrypt_file_streaming_v1(key_bytes, input_path, output_path);
-    } else if header_buf != HEADER_V2 {
-        return Err("invalid file header".to_string());
-    }
-
-    // Read master nonce
-    let mut master_nonce = [0u8; MASTER_NONCE_LEN];
-    input.read_exact(&mut master_nonce).map_err(|e| e.to_string())?;
-
-    // Read all encrypted chunks into memory (needed for parallel processing)
-    let mut chunk_data = Vec::new();
-    input.read_to_end(&mut chunk_data).map_err(|e| e.to_string())?;
-
-    // Parse chunks and decrypt in parallel
-    let mut chunk_index = 0u64;
-    let mut offset = 0;
-    let mut chunks = Vec::new();
-
-    // First pass: collect chunk info
-    while offset < chunk_data.len() {
-        if offset + 8 > chunk_data.len() {
-            break;
-        }
-
-        let len_bytes = [
-            chunk_data[offset],
-            chunk_data[offset + 1],
-            chunk_data[offset + 2],
-            chunk_data[offset + 3],
-            chunk_data[offset + 4],
-            chunk_data[offset + 5],
-            chunk_data[offset + 6],
-            chunk_data[offset + 7],
-        ];
-        let chunk_len = u64::from_le_bytes(len_bytes) as usize;
-
-        if chunk_len == 0 || offset + 8 + chunk_len > chunk_data.len() {
-            break;
-        }
-
-        let ciphertext = chunk_data[offset + 8..offset + 8 + chunk_len].to_vec();
-        chunks.push((chunk_index, ciphertext));
-
-        offset += 8 + chunk_len;
-        chunk_index += 1;
-    }
-
-    // Decrypt chunks in parallel
-    let decrypted: Result<Vec<Vec<u8>>, String> = chunks
-        .into_par_iter()
-        .with_max_len(num_threads)
-        .map(|(idx, ciphertext)| {
-            let chunk_nonce = derive_chunk_nonce(&master_nonce, idx);
-            let key = Key::from(*key_bytes);
-            let cipher = ChaCha20Poly1305::new(&key);
-            let nonce_ref = Nonce::from(chunk_nonce);
-
-            cipher
-                .decrypt(&nonce_ref, ciphertext.as_ref())
-                .map_err(|e| format!("Failed to decrypt chunk {}: {}", idx, e))
-        })
-        .collect();
-
-    let plaintext_chunks = decrypted?;
-
-    // Write decrypted chunks to output in order
-    let mut output = File::create(output_path).map_err(|e| e.to_string())?;
-    for plaintext in plaintext_chunks {
-        output.write_all(&plaintext).map_err(|e| e.to_string())?;
-    }
-
-    // Explicitly drop files to release OS resources immediately
-    drop(input);
-    drop(output);
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +420,68 @@ mod tests {
             fs::remove_file(decrypted)?;
         }
 
+        Ok(())
+    }
+
+    /// Write a file in the original V1 format (single-pass, whole file in memory).
+    /// Test-only: production code no longer writes this format, but must still be
+    /// able to read files locked by early versions of the app.
+    fn write_v1_file(key_bytes: &[u8; 32], plaintext: &[u8], output_path: &Path) -> Result<(), String> {
+        let key = Key::from(*key_bytes);
+        let cipher = ChaCha20Poly1305::new(&key);
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let nonce_ref = Nonce::from(nonce);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(HEADER_V1);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&cipher.encrypt(&nonce_ref, plaintext).map_err(|e| e.to_string())?);
+        fs::write(output_path, out).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_legacy_v1_file_still_decrypts() -> Result<(), Box<dyn std::error::Error>> {
+        let key = [0x4Du8; 32];
+        let encrypted = Path::new("test_v1compat_encrypted.vault");
+        let decrypted = Path::new("test_v1compat_decrypted.bin");
+        let payload = b"secrets locked by an early version of MyVault";
+
+        write_v1_file(&key, payload, encrypted)?;
+        assert!(is_encrypted_file(encrypted), "V1 file should be recognised");
+
+        decrypt_file_streaming(&key, encrypted, decrypted)?;
+        assert_eq!(payload.to_vec(), fs::read(decrypted)?, "V1 file must still decrypt");
+
+        // A wrong key must still be rejected on the legacy path
+        assert!(decrypt_file_streaming(&[0x00u8; 32], encrypted, decrypted).is_err());
+
+        fs::remove_file(encrypted)?;
+        if decrypted.exists() {
+            fs::remove_file(decrypted)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_encrypted_file_rejects_other_files() -> Result<(), Box<dyn std::error::Error>> {
+        let plain = Path::new("test_detect_plain.txt");
+        let tiny = Path::new("test_detect_tiny.bin");
+
+        fs::write(plain, b"just an ordinary text file, definitely not a vault")?;
+        assert!(!is_encrypted_file(plain), "Plain file must not be detected as encrypted");
+
+        // Shorter than the header: must not panic or misreport
+        fs::write(tiny, b"MY")?;
+        assert!(!is_encrypted_file(tiny), "Truncated file must not be detected as encrypted");
+
+        assert!(
+            !is_encrypted_file(Path::new("test_detect_does_not_exist.bin")),
+            "Missing file must not be detected as encrypted"
+        );
+
+        fs::remove_file(plain)?;
+        fs::remove_file(tiny)?;
         Ok(())
     }
 

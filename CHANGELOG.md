@@ -5,6 +5,31 @@ All notable changes to MyVault are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Upgraded eframe/egui from 0.27 to 0.32.
+- `config::save_config` takes a single `&Config` instead of a long positional
+  argument list, so adding a setting no longer changes its signature.
+
+### Fixed
+
+- The UI no longer sleeps 5ms on its own thread for every file queued in a batch
+  operation, which made the interface stutter on large batches.
+
+### Removed
+
+- Deleted unused modules `storage.rs`, `prefetch.rs`, `throughput.rs` and
+  `progress.rs` (~1,250 lines) - none were reachable from the application.
+  `performance.rs` is trimmed to the CPU/thread detection that is actually used.
+- Deleted the unused parallel encryption path (`encrypt_file_parallel` /
+  `decrypt_file_parallel`) and the unused `encrypt_blob` / `decrypt_blob` helpers.
+  Removing `encrypt_blob` also means the app can no longer write the legacy V1
+  format; V1 files remain readable.
+- Dropped the now-unused `rayon`, `memmap2` and `generic-array` dependencies and a
+  duplicate `winapi` entry.
+
 ## [1.0.0] - 2025-11-02
 
 ### Added

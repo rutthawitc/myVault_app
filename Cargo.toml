@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.27"
+eframe = "0.32"
 rfd = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -13,14 +13,10 @@ password-hash = { version = "0.5", features = ["alloc"] }
 rand = "0.8"
 zeroize = "1.7"
 chacha20poly1305 = "0.10"
-generic-array = "1.0"
 walkdir = "2.5"
-winapi = { version = "0.3", features = ["winnt", "fileapi", "winbase"], optional = true }
 
-# Phase 2: Parallelization
+# CPU detection for worker-thread sizing
 num_cpus = "1.16"
-rayon = "1.8"
-memmap2 = "0.9"
 
 # Cross-platform support
 dirs = "5.0"

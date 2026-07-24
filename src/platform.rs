@@ -74,8 +74,7 @@ pub fn hide(path: &Path) -> io::Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             format!("chflags failed: {}", String::from_utf8_lossy(&output.stderr))
         ))
     }
@@ -93,8 +92,7 @@ pub fn unhide(path: &Path) -> io::Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             format!("chflags failed: {}", String::from_utf8_lossy(&output.stderr))
         ))
     }

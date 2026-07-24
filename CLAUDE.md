@@ -41,15 +41,15 @@ The application follows a **layered, modular architecture**:
     ┌─────────┴──────────┬──────────┐
     │                    │          │
 ┌───▼────────┐  ┌────────▼───┐  ┌──▼──────────┐
-│ Crypto     │  │ Config &   │  │ Storage &   │
-│ (crypto.rs)│  │ Persistence│  │ Performance │
+│ Crypto     │  │ Config &   │  │ Performance │
+│ (crypto.rs)│  │ Persistence│  │ & Platform  │
 │            │  │ (config.rs)│  │ Modules     │
 └────────────┘  └────────────┘  └─────────────┘
     ↓                                 ↓
 ┌────────────────────────────────────────┐
-│ Streaming I/O & Parallelization       │  - 16MB chunk processing
-│ - rayon for data parallelism          │  - max 4 worker threads
-│ - File I/O with 32MB buffers          │  - CPU core detection
+│ Streaming I/O                          │  - 16MB chunk processing
+│ - one worker thread per file           │  - max 4 worker threads
+│ - File I/O with 32MB buffers           │  - CPU core detection
 └────────────────────────────────────────┘
 ```
 
@@ -57,23 +57,18 @@ The application follows a **layered, modular architecture**:
 
 | Module | Purpose | Key Details |
 |--------|---------|------------|
-| **main.rs** | UI & Application State | egui event loop, batch operations (706-838), file list management |
+| **main.rs** | UI & Application State | egui event loop, batch operations, file list management |
 | **crypto.rs** | Encryption/Decryption | ChaCha20-Poly1305 streaming (chunks), STREAM construction, roundtrip tests |
 | **config.rs** | JSON Persistence | Vault items, UI preferences, security settings storage |
-| **performance.rs** | Adaptive Configuration | CPU core detection, thread allocation strategy, memory thresholds |
-| **storage.rs** | Storage Type Detection | SSD vs HDD detection, prefetch strategy selection |
-| **prefetch.rs** | Read-Ahead Optimization | Improves I/O performance on HDD/Network drives |
-| **throughput.rs** | Performance Monitoring | Real-time timing, adaptive parallelism control |
-| **progress.rs** | Progress Tracking | UI feedback for batch operations |
+| **performance.rs** | Thread Sizing | CPU core detection, worker-thread count |
 | **platform.rs** | Platform-Specific APIs | File attributes (Windows), config directory paths (cross-platform) |
 | **model.rs** | Data Structures | VaultItem, ItemType enums, serialization |
 
 ### Architectural Patterns
 
 1. **Chunked Streaming**: Files processed in 16MB chunks to ensure O(1) memory regardless of file size
-2. **Bounded Parallelism**: Max 4 worker threads to prevent memory exhaustion (each ~48MB)
+2. **Bounded Parallelism**: Max 4 worker threads, one file per thread (prevents memory exhaustion)
 3. **Channel-Based Threading**: Background threads communicate via `mpsc` channels; UI stays responsive
-4. **Adaptive Strategy**: Detects CPU cores, storage type, and adjusts parallelism/prefetch
 5. **Configuration Persistence**: `vault_config.json` stored in platform-specific app directories
 6. **Secure Memory Handling**: All sensitive data (passwords, keys) explicitly zeroed using `zeroize` crate
 
@@ -91,7 +86,6 @@ The application follows a **layered, modular architecture**:
 - **Chunk size**: 16MB is the standard (don't change without benchmarking all scenarios)
 - **Buffer sizes**: 32MB I/O buffers for streaming operations
 - **CPU detection**: Use `num_cpus` crate to determine thread pool size
-- **Storage detection**: Use `storage.rs` to determine if SSD/HDD/Network and adjust prefetch accordingly
 
 ### Configuration & Persistence
 - **Config path**: Platform-aware (use `dirs` crate):
@@ -104,7 +98,7 @@ The application follows a **layered, modular architecture**:
 ### UI & Event Loop
 - **Framework**: egui (immediate-mode, cross-platform)
 - **Responsiveness**: All blocking operations must run in background threads
-- **Progress feedback**: Use `progress.rs` to track and display operation progress
+- **Progress feedback**: Batch progress is tracked on `BatchOp` (processed / failures / start_time)
 - **File dialogs**: Use `rfd` crate for native file/folder selection
 - **No blocking**: Main UI thread must never block on I/O or crypto operations
 
@@ -117,28 +111,29 @@ The application follows a **layered, modular architecture**:
 
 ### During Development
 - **Crypto changes**: Write roundtrip tests for various file sizes (1MB, 100MB, 1GB+)
-- **Performance changes**: Benchmark with 50+ files and different storage types
+- **Performance changes**: Benchmark with 50+ files
 - **UI changes**: Test responsiveness with large batch operations
 - **Memory safety**: Use `cargo check` and `cargo clippy` frequently
 
 ### Testing Strategy
 - **Crypto**: `cargo test --lib crypto::tests --release` (includes 1MB, 128MB, large file tests)
-- **Performance**: `cargo test --lib performance::tests --release` (CPU detection, thread allocation)
+- **Performance**: `cargo test --lib performance::tests --release` (CPU detection, thread count)
 - **Integration**: `cargo test --all --release` (full system testing)
 - **Manual**: `cargo run --release` and test with actual files (UI responsiveness, correctness)
 
 ## Important Code Locations
 
+> Referenced by symbol rather than line number, so these stay correct as the code moves.
+
 | Task | Location |
 |------|----------|
-| Batch operation thread spawning | `src/main.rs:706-838` |
-| Streaming encryption/decryption | `src/crypto.rs:122-193` |
-| Chunked file processing | `src/crypto.rs:200+` |
-| Performance/parallelism strategy | `src/performance.rs` |
-| Configuration saving/loading | `src/config.rs:140+` |
-| UI event loop & state | `src/main.rs:633+` |
-| Crypto test cases | `src/crypto.rs:650+` |
-| Storage type detection | `src/storage.rs:30+` |
+| Batch operation thread spawning | `MyVaultApp::update` in `src/main.rs` (the `current_op` block) |
+| Streaming encryption / decryption | `crypto::encrypt_file_streaming` / `crypto::decrypt_file_streaming` |
+| Legacy format reading (V1) | `crypto::decrypt_file_streaming_v1` |
+| Worker-thread count | `src/performance.rs` |
+| Configuration saving / loading | `config::save_config` / `config::load_config` |
+| Encrypted filename mapping | `MyVaultApp::encrypted_path_for` / `original_path_for` |
+| Crypto test cases | `mod tests` at the end of `src/crypto.rs` |
 
 ## Common Development Tasks
 
@@ -178,11 +173,9 @@ The application follows a **layered, modular architecture**:
 
 ### Concurrency & Performance
 - **num_cpus** (1.16): CPU core detection
-- **rayon** (1.8): Data parallelism (reserved for future use)
-- **memmap2** (0.9): Memory-mapped files (reserved for future use)
 
 ### UI & Files
-- **eframe** (0.27) + **egui**: Cross-platform immediate-mode GUI
+- **eframe** (0.32) + **egui**: Cross-platform immediate-mode GUI
 - **rfd** (0.14): Native file/folder dialogs
 - **walkdir** (2.5): Recursive directory traversal
 

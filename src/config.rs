@@ -135,35 +135,8 @@ pub fn load_config() -> io::Result<Config> {
     Ok(cfg)
 }
 
-pub fn save_config(
-    items: &[VaultItem],
-    master_password_hash: Option<&str>,
-    salt: Option<&str>,
-    dark_mode: bool,
-    sort_by: &str,
-    sort_ascending: bool,
-    recent_files: &[String],
-    session_timeout_minutes: u64,
-    auto_lock_enabled: bool,
-    password_change_reminder_days: u64,
-    password_last_changed: Option<u64>,
-    reminder_dismissed_until: Option<u64>,
-) -> io::Result<()> {
-    let cfg = Config {
-        master_password_hash: master_password_hash.map(|s| s.to_string()),
-        salt: salt.map(|s| s.to_string()),
-        vault_items: items.iter().map(ConfigItem::from).collect(),
-        dark_mode,
-        sort_by: sort_by.to_string(),
-        sort_ascending,
-        recent_files: recent_files.to_vec(),
-        session_timeout_minutes,
-        auto_lock_enabled,
-        password_change_reminder_days,
-        password_last_changed,
-        reminder_dismissed_until,
-    };
-    let json = serde_json::to_vec_pretty(&cfg).unwrap_or_else(|_| b"{}".to_vec());
+pub fn save_config(cfg: &Config) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(cfg).unwrap_or_else(|_| b"{}".to_vec());
     let path = config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
