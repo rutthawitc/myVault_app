@@ -98,19 +98,61 @@ pub fn unhide(path: &Path) -> io::Result<()> {
     }
 }
 
-// Linux implementation (no-op for now, could add dotfile prefix in future)
+// Linux has no filesystem-level "hidden" attribute: hiding on Unix means a
+// leading dot in the name. Encrypted *files* get that dot from
+// `MyVaultApp::encrypted_path_for`, but a folder keeps its original name, so
+// there is nothing this can do for it.
+//
+// Report that honestly instead of returning Ok. Returning Ok here used to make
+// the caller mark the folder as hidden and tell the user "Hidden 1 folder(s)"
+// while the folder was still in plain sight.
 #[cfg(target_os = "linux")]
-pub fn hide(_path: &Path) -> io::Result<()> { Ok(()) }
+pub fn hide(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hiding folders is not supported on Linux (a folder would have to be renamed)",
+    ))
+}
 
+// Unhiding is still a success: nothing was hidden, so there is nothing to undo.
 #[cfg(target_os = "linux")]
 pub fn unhide(_path: &Path) -> io::Result<()> { Ok(()) }
 
-// Fallback for other platforms
+// Fallback for other platforms - same reasoning as Linux.
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-pub fn hide(_path: &Path) -> io::Result<()> { Ok(()) }
+pub fn hide(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hiding folders is not supported on this platform",
+    ))
+}
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn unhide(_path: &Path) -> io::Result<()> { Ok(()) }
+
+/// Hide a file that has just been encrypted.
+///
+/// Separate from [`hide`], which is for folders. On Unix the encrypted name
+/// already begins with a dot (see `MyVaultApp::encrypted_path_for`) and that is
+/// what hides it, so there is nothing left to do — calling `chflags` per file
+/// would spawn a process for every file in a batch to no visible effect.
+/// Windows has no such convention and needs the explicit attribute.
+#[cfg(target_os = "windows")]
+pub fn hide_encrypted_file(path: &Path) -> io::Result<()> {
+    hide(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn hide_encrypted_file(_path: &Path) -> io::Result<()> { Ok(()) }
+
+/// Undo [`hide_encrypted_file`] before decrypting a file back to its original name.
+#[cfg(target_os = "windows")]
+pub fn unhide_encrypted_file(path: &Path) -> io::Result<()> {
+    unhide(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn unhide_encrypted_file(_path: &Path) -> io::Result<()> { Ok(()) }
 
 /// Get the platform identifier
 #[allow(dead_code)]

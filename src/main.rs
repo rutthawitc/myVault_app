@@ -986,7 +986,7 @@ impl eframe::App for MyVaultApp {
 
                             match encrypt_result {
                                 Ok(_) => {
-                                    let _ = crate::platform::hide(&out);
+                                    let _ = crate::platform::hide_encrypted_file(&out);
                                     let _ = std::fs::remove_file(&p);
                                     (true, None)
                                 }
@@ -994,7 +994,7 @@ impl eframe::App for MyVaultApp {
                             }
                         }
                         BatchOpKind::UnlockFolder => {
-                            let _ = crate::platform::unhide(&p);
+                            let _ = crate::platform::unhide_encrypted_file(&p);
                             if let Some(out) = MyVaultApp::original_path_for(&p) {
                                 // Check if original file already exists
                                 if out.exists() {
@@ -2391,6 +2391,44 @@ mod tests {
     #[test]
     fn test_path_roundtrip_dotfile() {
         assert_roundtrip("/tmp/vault/.env");
+    }
+
+    /// `platform::hide_encrypted_file` is deliberately a no-op on Unix because the
+    /// encrypted name already starts with a dot, which is what hides it there.
+    /// If that dot ever stops being added, this test fails and points at the
+    /// no-op as the thing that has to change with it.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_encrypted_files_are_dot_hidden_on_unix() {
+        for original in ["report.pdf", "/tmp/vault/archive.tar.gz", "/tmp/vault/README"] {
+            let encrypted = MyVaultApp::encrypted_path_for(&PathBuf::from(original));
+            let name = encrypted.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                name.starts_with('.'),
+                "{} encrypts to {}, which is not hidden on Unix",
+                original,
+                name
+            );
+        }
+
+        // Given the above, hiding an encrypted file needs no extra syscall.
+        let tmp = std::env::temp_dir().join(".myvault_hide_noop_test");
+        std::fs::write(&tmp, b"x").unwrap();
+        assert!(crate::platform::hide_encrypted_file(&tmp).is_ok());
+        assert!(tmp.exists(), "The no-op must leave the file untouched");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Folders keep their original name, so on Linux there is no way to hide one.
+    /// It must report that rather than claiming success.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_folder_hiding_reports_unsupported_on_linux() {
+        let dir = std::env::temp_dir();
+        let err = crate::platform::hide(&dir).expect_err("Linux cannot hide a folder");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        // Undoing something that never happened is still fine.
+        assert!(crate::platform::unhide(&dir).is_ok());
     }
 
     #[test]

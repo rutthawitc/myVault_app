@@ -87,6 +87,10 @@ The application follows a **layered, modular architecture**:
 - **File formats**: V3 is the only format written. V1 and V2 are read-only for backward
   compatibility — never add a new code path that writes them.
 - **Durability**: `sync_all()` the output before the caller deletes the source file.
+- **Hiding files vs folders are different mechanisms.** On Unix an encrypted *file*
+  is hidden by the leading dot in its name (`encrypted_path_for`), so
+  `platform::hide_encrypted_file` is a no-op there. A *folder* keeps its name and
+  needs `platform::hide`, which only Windows and macOS can do. Do not merge the two.
 - **Untrusted input**: Any length or offset read out of a file must be bounds-checked
   before it is used to allocate.
 

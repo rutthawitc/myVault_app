@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which discarded the key material). It is backed up and reported instead.
 - The UI no longer sleeps 5ms on its own thread for every file queued in a batch
   operation, which made the interface stutter on large batches.
+- On Linux, locking a folder reported "Hidden N folder(s)" and recorded the folder
+  as hidden even though nothing was hidden - Linux has no hidden attribute and the
+  call did nothing. It now reports that folder hiding is unsupported there.
+- Encrypting a file on macOS no longer spawns a `chflags` process per file. The
+  encrypted name already starts with a dot on Unix, which is what hides it;
+  folder hiding, which has no such fallback, still uses `chflags`.
 
 ### Changed
 
