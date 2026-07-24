@@ -80,6 +80,10 @@ The application follows a **layered, modular architecture**:
 - **Nonce generation**: Must use `OsRng` for cryptographically secure randomness
 - **Memory cleanup**: All password buffers and key material must be `zeroize`d after use
 - **Testing**: All crypto changes require roundtrip tests (encrypt → decrypt → verify integrity)
+- **Never derive the file key from the password directly.** Files are encrypted with the
+  Data Encryption Key; the password-derived key only wraps it. Breaking this makes a
+  password change destroy every existing encrypted file.
+- **Durability**: `sync_all()` the output before the caller deletes the source file.
 
 ### Performance & Parallelism
 - **Max worker threads**: Hard limit of 4 threads (prevents memory exhaustion during batch operations)
@@ -93,7 +97,8 @@ The application follows a **layered, modular architecture**:
   - macOS: `~/Library/Application Support/MyVault/vault_config.json`
   - Linux: `~/.local/share/myvault/vault_config.json`
 - **Format**: JSON serializable structs with `serde`
-- **Contents**: Argon2 hash of master password, vault items list, UI preferences, security settings
+- **Contents**: Argon2 hash of master password, the wrapped Data Encryption Key, vault items list, UI preferences, security settings
+- **Never** fall back to a default config on a parse error - that would discard the wrapped DEK and make every encrypted file unrecoverable
 
 ### UI & Event Loop
 - **Framework**: egui (immediate-mode, cross-platform)
@@ -131,6 +136,8 @@ The application follows a **layered, modular architecture**:
 | Streaming encryption / decryption | `crypto::encrypt_file_streaming` / `crypto::decrypt_file_streaming` |
 | Legacy format reading (V1) | `crypto::decrypt_file_streaming_v1` |
 | Worker-thread count | `src/performance.rs` |
+| Envelope encryption (DEK/KEK) | `crypto::wrap_dek` / `crypto::unwrap_dek` |
+| Vault key lifecycle | `MyVaultApp::create_vault_key` / `unlock_vault_key` / `rewrap_vault_key` |
 | Configuration saving / loading | `config::save_config` / `config::load_config` |
 | Encrypted filename mapping | `MyVaultApp::encrypted_path_for` / `original_path_for` |
 | Crypto test cases | `mod tests` at the end of `src/crypto.rs` |

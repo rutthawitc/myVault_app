@@ -3,6 +3,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use password_hash::{rand_core::OsRng, SaltString};
 use rand::RngCore;
+use zeroize::Zeroize;
 
 pub fn hash_password(password: &str) -> Result<(String, String), String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -34,6 +35,94 @@ pub fn derive_key(password: &str, salt_str: &str) -> Result<[u8; 32], String> {
         .hash_password_into(password.as_bytes(), salt_str.as_bytes(), &mut key)
         .map_err(|e| e.to_string())?;
     Ok(key)
+}
+
+// Envelope encryption (DEK/KEK)
+//
+// The Data Encryption Key (DEK) is a random 32-byte key that encrypts every file
+// and NEVER changes for the lifetime of the vault. The Key Encryption Key (KEK) is
+// derived from the master password via Argon2id and is only used to wrap the DEK.
+//
+// Changing the master password re-wraps the same DEK with a new KEK, so previously
+// encrypted files remain decryptable. Without this indirection, a password change
+// would derive a brand-new file key and permanently orphan every existing file.
+
+const WRAPPED_DEK_LEN: usize = NONCE_LEN + 32 + 16; // nonce + key + Poly1305 tag
+
+/// Generate a fresh random Data Encryption Key.
+pub fn generate_dek() -> [u8; 32] {
+    let mut dek = [0u8; 32];
+    OsRng.fill_bytes(&mut dek);
+    dek
+}
+
+/// Wrap (encrypt) the DEK with the KEK derived from the master password.
+///
+/// Returns a hex string safe to store in `vault_config.json`.
+pub fn wrap_dek(kek: &[u8; 32], dek: &[u8; 32]) -> Result<String, String> {
+    let key = Key::from(*kek);
+    let cipher = ChaCha20Poly1305::new(&key);
+
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce_ref = Nonce::from(nonce);
+
+    let mut ciphertext = cipher
+        .encrypt(&nonce_ref, dek.as_ref())
+        .map_err(|_| "failed to wrap data encryption key".to_string())?;
+
+    let mut blob = Vec::with_capacity(WRAPPED_DEK_LEN);
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    ciphertext.zeroize();
+
+    Ok(to_hex(&blob))
+}
+
+/// Unwrap (decrypt) the DEK using the KEK derived from the master password.
+///
+/// Fails if the password is wrong or the stored blob was tampered with.
+pub fn unwrap_dek(kek: &[u8; 32], wrapped_hex: &str) -> Result<[u8; 32], String> {
+    let blob = from_hex(wrapped_hex)?;
+    if blob.len() != WRAPPED_DEK_LEN {
+        return Err("stored key blob has invalid length".to_string());
+    }
+
+    let key = Key::from(*kek);
+    let cipher = ChaCha20Poly1305::new(&key);
+
+    let nonce_array = <[u8; NONCE_LEN]>::try_from(&blob[..NONCE_LEN])
+        .map_err(|_| "invalid nonce".to_string())?;
+    let nonce_ref = Nonce::from(nonce_array);
+
+    let mut plaintext = cipher
+        .decrypt(&nonce_ref, &blob[NONCE_LEN..])
+        .map_err(|_| "failed to unwrap data encryption key".to_string())?;
+
+    let dek = <[u8; 32]>::try_from(plaintext.as_slice())
+        .map_err(|_| "unwrapped key has invalid length".to_string())?;
+    plaintext.zeroize();
+
+    Ok(dek)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+fn from_hex(s: &str) -> Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) {
+        return Err("stored key blob is malformed".to_string());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "stored key blob is malformed".to_string()))
+        .collect()
 }
 
 // File format headers
@@ -142,12 +231,18 @@ pub fn encrypt_file_streaming(
         chunk_index += 1;
     }
 
-    // Flush buffer to ensure all data is written
+    // Flush the buffer, then fsync so the ciphertext is durable on disk.
+    // The caller deletes the plaintext source right after this returns, so a
+    // flush alone (which only reaches the OS page cache) is not enough: a crash
+    // or power loss in between would destroy the original AND leave a truncated
+    // ciphertext behind.
     output.flush().map_err(|e| e.to_string())?;
+    let file = output.into_inner().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
 
     // Explicitly drop files to release OS resources immediately
     drop(input);
-    drop(output);
+    drop(file);
 
     Ok(())
 }
@@ -224,12 +319,14 @@ pub fn decrypt_file_streaming(
         chunk_index += 1;
     }
 
-    // Flush buffer to ensure all data is written
+    // Flush + fsync before the caller removes the encrypted source file
     output.flush().map_err(|e| e.to_string())?;
+    let file = output.into_inner().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
 
     // Explicitly drop files to release OS resources immediately
     drop(input);
-    drop(output);
+    drop(file);
 
     Ok(())
 }
@@ -269,6 +366,9 @@ fn decrypt_file_streaming_v1(
         .map_err(|e| e.to_string())?;
 
     output.write_all(&plaintext).map_err(|e| e.to_string())?;
+
+    // fsync before the caller removes the encrypted source file
+    output.sync_all().map_err(|e| e.to_string())?;
 
     // Explicitly drop files to release OS resources immediately
     drop(input);
@@ -482,6 +582,127 @@ mod tests {
 
         fs::remove_file(plain)?;
         fs::remove_file(tiny)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_dek_wrap_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let kek = derive_key("correct horse battery staple", "somesaltvalue")?;
+        let dek = generate_dek();
+
+        let wrapped = wrap_dek(&kek, &dek)?;
+        let unwrapped = unwrap_dek(&kek, &wrapped)?;
+
+        assert_eq!(dek, unwrapped, "Unwrapped DEK should match the original");
+        Ok(())
+    }
+
+    #[test]
+    fn test_dek_unwrap_rejects_wrong_password() -> Result<(), Box<dyn std::error::Error>> {
+        let kek = derive_key("right-password", "somesaltvalue")?;
+        let wrong_kek = derive_key("wrong-password", "somesaltvalue")?;
+        let dek = generate_dek();
+
+        let wrapped = wrap_dek(&kek, &dek)?;
+        assert!(
+            unwrap_dek(&wrong_kek, &wrapped).is_err(),
+            "Unwrapping with the wrong password must fail"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_dek_unwrap_rejects_tampered_blob() -> Result<(), Box<dyn std::error::Error>> {
+        let kek = derive_key("a-password", "somesaltvalue")?;
+        let dek = generate_dek();
+        let wrapped = wrap_dek(&kek, &dek)?;
+
+        // Flip one hex character in the ciphertext
+        let mut chars: Vec<char> = wrapped.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == 'a' { 'b' } else { 'a' };
+        let tampered: String = chars.into_iter().collect();
+
+        assert!(
+            unwrap_dek(&kek, &tampered).is_err(),
+            "Authentication tag must reject a tampered key blob"
+        );
+
+        assert!(unwrap_dek(&kek, "not-hex").is_err());
+        assert!(unwrap_dek(&kek, "abcd").is_err(), "Short blob must be rejected");
+        Ok(())
+    }
+
+    /// Regression test for the data-loss bug: changing the master password used to
+    /// derive a brand-new file key, which made every existing encrypted file
+    /// permanently unreadable. With envelope encryption the DEK survives the change.
+    #[test]
+    fn test_password_change_keeps_files_decryptable() -> Result<(), Box<dyn std::error::Error>> {
+        let input = Path::new("test_pwchange_input.bin");
+        let encrypted = Path::new("test_pwchange_encrypted.vault");
+        let decrypted = Path::new("test_pwchange_decrypted.bin");
+
+        // --- Vault setup with the original password ---
+        let old_kek = derive_key("old-master-password", "originalsaltvalue")?;
+        let dek = generate_dek();
+        let wrapped = wrap_dek(&old_kek, &dek)?;
+
+        // Encrypt a file with the DEK
+        create_test_file(input, 2 * 1024 * 1024)?;
+        let original_data = fs::read(input)?;
+        encrypt_file_streaming(&dek, input, encrypted)?;
+
+        // --- User changes the master password (new salt, new KEK, same DEK) ---
+        let recovered = unwrap_dek(&old_kek, &wrapped)?;
+        let new_kek = derive_key("brand-new-password", "differentsaltvalue")?;
+        let rewrapped = wrap_dek(&new_kek, &recovered)?;
+
+        // --- Later session: log in with the new password only ---
+        let session_kek = derive_key("brand-new-password", "differentsaltvalue")?;
+        let session_dek = unwrap_dek(&session_kek, &rewrapped)?;
+
+        decrypt_file_streaming(&session_dek, encrypted, decrypted)?;
+        let decrypted_data = fs::read(decrypted)?;
+
+        assert_eq!(
+            original_data, decrypted_data,
+            "File encrypted before the password change must still decrypt after it"
+        );
+
+        // The old password must no longer open the vault
+        assert!(unwrap_dek(&old_kek, &rewrapped).is_err());
+
+        fs::remove_file(input)?;
+        fs::remove_file(encrypted)?;
+        fs::remove_file(decrypted)?;
+        Ok(())
+    }
+
+    /// Legacy vaults have no wrapped DEK; the password-derived key *is* the file key.
+    /// Adopting it as the DEK must keep old files readable.
+    #[test]
+    fn test_legacy_vault_migration() -> Result<(), Box<dyn std::error::Error>> {
+        let input = Path::new("test_legacy_input.bin");
+        let encrypted = Path::new("test_legacy_encrypted.vault");
+        let decrypted = Path::new("test_legacy_decrypted.bin");
+
+        // Old behaviour: file key derived straight from the password
+        let legacy_key = derive_key("legacy-password", "legacysaltvalue")?;
+        create_test_file(input, 1024 * 1024)?;
+        let original_data = fs::read(input)?;
+        encrypt_file_streaming(&legacy_key, input, encrypted)?;
+
+        // Migration on next login: adopt the derived key as the DEK and wrap it
+        let kek = derive_key("legacy-password", "legacysaltvalue")?;
+        let wrapped = wrap_dek(&kek, &kek)?;
+        let dek = unwrap_dek(&kek, &wrapped)?;
+
+        decrypt_file_streaming(&dek, encrypted, decrypted)?;
+        assert_eq!(original_data, fs::read(decrypted)?, "Legacy file must survive migration");
+
+        fs::remove_file(input)?;
+        fs::remove_file(encrypted)?;
+        fs::remove_file(decrypted)?;
         Ok(())
     }
 

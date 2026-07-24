@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Envelope encryption (DEK/KEK).** Files are now encrypted with a random Data
+  Encryption Key that never changes. The master password only wraps that key.
+  Changing the master password re-wraps the same key instead of deriving a new
+  one - previously this permanently orphaned every already-encrypted file.
+  Existing vaults are migrated automatically on the next successful login, and
+  files encrypted before the change remain readable.
+
+### Fixed
+
+- Encrypted output is flushed **and fsynced** before the plaintext original is
+  deleted. A crash or power loss mid-operation can no longer destroy both copies.
+- Locking a file no longer overwrites an existing encrypted file with the same
+  name; the affected file is reported instead.
+- `vault_config.json` is fsynced before the atomic rename.
+- A corrupted `vault_config.json` is no longer silently replaced with defaults
+  (which discarded the key material). It is backed up and reported instead.
+
 ### Changed
 
 - Upgraded eframe/egui from 0.27 to 0.32.

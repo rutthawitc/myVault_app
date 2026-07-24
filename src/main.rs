@@ -90,7 +90,11 @@ struct MyVaultApp {
     show_password_dialog: bool,
     temp_password: String,
     temp_password_confirm: String,
+    /// The Data Encryption Key, unwrapped in memory while the vault is unlocked.
+    /// It is independent of the master password, so changing the password does
+    /// not invalidate previously encrypted files.
     encryption_key: Option<[u8; 32]>,
+    wrapped_dek: Option<String>,
     confirm_action: Option<ConfirmAction>,
     current_op: Option<BatchOp>,
     op_result_rxs: Vec<Receiver<(PathBuf, bool, Option<String>)>>,  // Multiple background thread receivers for parallel processing (path, success, optional_error_msg)
@@ -148,6 +152,7 @@ impl MyVaultApp {
             temp_password: String::new(),
             temp_password_confirm: String::new(),
             encryption_key: None,
+            wrapped_dek: None,
             confirm_action: None,
             current_op: None,
             op_result_rxs: Vec::new(),
@@ -187,11 +192,75 @@ impl MyVaultApp {
         app
     }
 
+    /// Set up key material for a brand-new vault.
+    ///
+    /// Generates a random Data Encryption Key and stores it wrapped with the
+    /// key derived from the master password.
+    fn create_vault_key(&mut self, password: &str, salt: &str) -> Result<(), String> {
+        let mut kek = crypto::derive_key(password, salt)?;
+        let dek = crypto::generate_dek();
+        let wrapped = crypto::wrap_dek(&kek, &dek);
+        kek.zeroize();
+
+        self.wrapped_dek = Some(wrapped?);
+        self.encryption_key = Some(dek);
+        Ok(())
+    }
+
+    /// Unlock the vault: derive the key-encryption key from the password and
+    /// recover the Data Encryption Key used to encrypt files.
+    ///
+    /// Vaults created before envelope encryption have no wrapped DEK stored. For
+    /// those, the file key *was* the password-derived key, so we adopt that key as
+    /// the DEK and wrap it in place. Existing files stay decryptable, and from then
+    /// on a password change only re-wraps the DEK instead of orphaning every file.
+    fn unlock_vault_key(&mut self, password: &str) -> Result<(), String> {
+        let salt = self
+            .salt
+            .clone()
+            .ok_or("Vault salt is missing from the configuration")?;
+        let mut kek = crypto::derive_key(password, &salt)?;
+
+        let existing = self.wrapped_dek.clone();
+        let outcome = match existing {
+            Some(w) => crypto::unwrap_dek(&kek, &w).map(|dek| (dek, None)),
+            // Legacy vault: adopt the derived key as the DEK and wrap it.
+            None => crypto::wrap_dek(&kek, &kek).map(|w| (kek, Some(w))),
+        };
+        kek.zeroize();
+
+        let (dek, newly_wrapped) = outcome?;
+        self.encryption_key = Some(dek);
+
+        if let Some(w) = newly_wrapped {
+            self.wrapped_dek = Some(w);
+            self.save_config();
+        }
+        Ok(())
+    }
+
+    /// Re-wrap the existing Data Encryption Key with a new password.
+    ///
+    /// This is what makes a password change safe: the DEK never changes, so every
+    /// file encrypted under the old password remains decryptable.
+    fn rewrap_vault_key(&mut self, new_password: &str, new_salt: &str) -> Result<(), String> {
+        let dek = self
+            .encryption_key
+            .ok_or("Vault is locked - unlock it before changing the master password")?;
+        let mut kek = crypto::derive_key(new_password, new_salt)?;
+        let wrapped = crypto::wrap_dek(&kek, &dek);
+        kek.zeroize();
+
+        self.wrapped_dek = Some(wrapped?);
+        Ok(())
+    }
+
     fn load_from_config(&mut self) {
         match config::load_config() {
             Ok(cfg) => {
                 self.master_password_hash = cfg.master_password_hash;
                 self.salt = cfg.salt;
+                self.wrapped_dek = cfg.wrapped_dek;
                 self.items = cfg.vault_items.iter().map(|c| c.into()).collect();
 
                 // Phase 2 & 3: Restore UI preferences
@@ -253,6 +322,7 @@ impl MyVaultApp {
         let cfg = config::Config {
             master_password_hash: self.master_password_hash.clone(),
             salt: self.salt.clone(),
+            wrapped_dek: self.wrapped_dek.clone(),
             vault_items: self.items.iter().map(config::ConfigItem::from).collect(),
             dark_mode: self.dark_mode,
             sort_by: sort_by_str.to_string(),
@@ -888,6 +958,17 @@ impl eframe::App for MyVaultApp {
                     let res = match op_kind {
                         BatchOpKind::LockFolder => {
                             let out = MyVaultApp::encrypted_path_for(&p);
+
+                            // Refuse to overwrite an existing encrypted file: File::create
+                            // truncates, which would destroy the previous ciphertext.
+                            if out.exists() {
+                                let _ = result_tx.send((
+                                    p_clone,
+                                    false,
+                                    Some(format!("Encrypted file already exists: {}", out.display())),
+                                ));
+                                return;
+                            }
 
                             // Determine encryption strategy based on file size
                             let _file_size = std::fs::metadata(&p)
@@ -1573,19 +1654,20 @@ impl eframe::App for MyVaultApp {
                                 if ui.button("Enter").clicked() || enter_pressed {
                                     if let Some(hash) = self.master_password_hash.as_deref() { match crypto::verify_password(&self.temp_password, hash) {
                                         Ok(true) => {
-                                            // derive session key
-                                            if let Some(salt) = &self.salt {
-                                                match crypto::derive_key(&self.temp_password, salt) {
-                                                    Ok(k) => { self.encryption_key = Some(k); }
-                                                    Err(e) => { self.status_message = format!("Key derivation error: {}", e); }
+                                            // Recover the Data Encryption Key for this session
+                                            match self.unlock_vault_key(&self.temp_password.clone()) {
+                                                Ok(()) => {
+                                                    self.authenticated = true;
+                                                    self.status_message = "Authenticated".to_string();
+                                                    self.show_password_dialog = false;
+
+                                                    // Phase 3: Check if password change reminder should be shown
+                                                    self.check_password_reminder();
+                                                }
+                                                Err(e) => {
+                                                    self.status_message = format!("Could not unlock vault: {}", e);
                                                 }
                                             }
-                                            self.authenticated = true;
-                                            self.status_message = "Authenticated".to_string();
-                                            self.show_password_dialog = false;
-
-                                            // Phase 3: Check if password change reminder should be shown
-                                            self.check_password_reminder();
                                         }
                                         Ok(false) => {
                                             self.status_message = "Invalid password".to_string();
@@ -1607,23 +1689,24 @@ impl eframe::App for MyVaultApp {
                                     } else {
                                         match crypto::hash_password(&self.temp_password) {
                                             Ok((hash, salt)) => {
-                                                self.master_password_hash = Some(hash);
-                                                self.salt = Some(salt);
-                                                // derive session key
-                                                if let Some(salt) = &self.salt {
-                                                    match crypto::derive_key(&self.temp_password, salt) {
-                                                        Ok(k) => { self.encryption_key = Some(k); }
-                                                        Err(e) => { self.status_message = format!("Key derivation error: {}", e); }
+                                                // Generate and wrap the vault's Data Encryption Key
+                                                match self.create_vault_key(&self.temp_password.clone(), &salt) {
+                                                    Ok(()) => {
+                                                        self.master_password_hash = Some(hash);
+                                                        self.salt = Some(salt);
+                                                        self.authenticated = true;
+                                                        self.status_message = "Master password created".to_string();
+
+                                                        // Phase 3: Record password creation time
+                                                        self.password_last_changed = Some(SystemTime::now());
+
+                                                        self.save_config();
+                                                        self.show_password_dialog = false;
+                                                    }
+                                                    Err(e) => {
+                                                        self.status_message = format!("Key setup error: {}", e);
                                                     }
                                                 }
-                                                self.authenticated = true;
-                                                self.status_message = "Master password created".to_string();
-
-                                                // Phase 3: Record password creation time
-                                                self.password_last_changed = Some(SystemTime::now());
-
-                                                self.save_config();
-                                                self.show_password_dialog = false;
                                             }
                                             Err(e) => {
                                                 self.status_message = format!("Hashing error: {}", e);
@@ -1739,14 +1822,14 @@ impl eframe::App for MyVaultApp {
                                             // Hash the new password
                                             match crypto::hash_password(&self.new_password) {
                                                 Ok((new_hash, new_salt)) => {
-                                                    // Update the stored hash and salt
-                                                    self.master_password_hash = Some(new_hash);
-                                                    self.salt = Some(new_salt.clone());
-
-                                                    // Re-derive the encryption key with the new password and salt
-                                                    match crypto::derive_key(&self.new_password, &new_salt) {
-                                                        Ok(new_key) => {
-                                                            self.encryption_key = Some(new_key);
+                                                    // Re-wrap the existing Data Encryption Key with the new
+                                                    // password. The DEK itself is unchanged, so files that were
+                                                    // encrypted under the old password stay decryptable.
+                                                    // Only commit the new hash/salt once this succeeds.
+                                                    match self.rewrap_vault_key(&self.new_password.clone(), &new_salt) {
+                                                        Ok(()) => {
+                                                            self.master_password_hash = Some(new_hash);
+                                                            self.salt = Some(new_salt);
 
                                                             // Phase 3: Record password change time and hide reminder
                                                             self.password_last_changed = Some(SystemTime::now());
@@ -1758,7 +1841,7 @@ impl eframe::App for MyVaultApp {
                                                             self.show_change_password_dialog = false;
                                                         }
                                                         Err(e) => {
-                                                            self.status_message = format!("Key derivation error: {}", e);
+                                                            self.status_message = format!("Password not changed: {}", e);
                                                         }
                                                     }
                                                 }
