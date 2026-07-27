@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Thai (and other non-Latin) filenames render properly.** egui ships no font
+  face covering Thai, so those names appeared as rows of empty boxes. A system
+  font is located per platform and appended as a fallback; if none is found the
+  app behaves exactly as before.
+- **Vault state is visible at a glance.** The status bar shows whether the vault
+  is locked or unlocked and counts down to the next auto-lock. Previously the
+  only clue was whether the file list looked greyed out.
+- Password fields have a reveal toggle, so a long generated password no longer
+  has to be typed twice blind.
+- The progress dialog names the files currently being encrypted or decrypted. A
+  single large file used to sit at 0% with no sign that anything was happening.
+- "Add Files" accepts a multi-selection instead of one file per dialog.
+- The locked view offers an Unlock button where the user is already looking, and
+  the password prompt opens on launch.
+
 ### Security
 
+- **Auto-lock never fired while the app sat untouched.** egui repaints in
+  response to input, so the inactivity check only ran when someone was already
+  at the keyboard — the exact situation auto-lock exists to protect against. The
+  app now requests a repaint every second while unlocked.
+- Locking the vault clears the current selection, so a selection made before
+  locking cannot become the target of an action in the next session.
+- Password fields are wiped on every dialog exit path, not only via the Cancel
+  button.
 - **Envelope encryption (DEK/KEK).** Files are now encrypted with a random Data
   Encryption Key that never changes. The master password only wraps that key.
   Changing the master password re-wraps the same key instead of deriving a new
@@ -26,6 +51,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The confirmation dialog named one file however many were selected.** It read
+  a single arbitrary item out of a `HashSet`, so confirming a fifty-file Lock
+  looked like confirming one file while the originals of all fifty were deleted.
+  It now states the count, lists the affected paths, and says plainly that
+  originals are deleted.
+- **Select All ignored the search filter**, so a filtered view plus Ctrl+A handed
+  files the user could not see to the next Lock. Selection now covers only the
+  visible rows.
+- **Shift+click selected the wrong files.** Ranges were taken over insertion
+  order while the list is drawn filtered, sorted and grouped by folder, so the
+  selection differed from the rows highlighted between the two clicks. Ranges now
+  follow the painted order.
+- **Cancel did not cancel.** It dropped the operation but left worker threads
+  encrypting and deleting, and left their result channels to be inherited and
+  misreported by the next operation. Cancelling now stops dispatch, lets
+  in-flight files finish so none is left truncated, and reports how far it got.
+- Keyboard shortcuts matched the Ctrl modifier, which is never set on macOS, so
+  none of them worked in the macOS build. They use the platform command key now.
+- Removing items always reported "Removed 0 items" — the count was read after the
+  selection had been cleared.
+- Escape cleared the selection instead of closing the open dialog, and dialogs
+  could be clicked through to the controls behind them. All dialogs are now
+  modal and close on Escape or an outside click. The progress dialog
+  deliberately does not, since an operation is in flight.
+- The password generator's strength bar divided the level by 100 instead of
+  taking a fraction of three, so it showed a four-pixel sliver however strong the
+  password was. All three strength meters now share one implementation.
+- The toolbar packed its buttons into one non-wrapping row, so narrowing the
+  window cut off the trailing ones.
 - Encrypted output is flushed **and fsynced** before the plaintext original is
   deleted. A crash or power loss mid-operation can no longer destroy both copies.
 - Locking a file no longer overwrites an existing encrypted file with the same
@@ -44,6 +98,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The file list only draws the rows it can show.** Every row of the vault used
+  to be laid out on every frame; the list is now virtualized, so a
+  thousand-item vault paints the ~30 rows in view.
+- **File sizes are cached on the item instead of being read from disk while
+  painting.** `metadata()` ran for every row on every frame, and twice per
+  comparison when sorting by size — thousands of syscalls per second for as long
+  as the window was open. A locked item now also keeps showing the size it had
+  before encryption instead of "N/A".
+- **Encrypted files are no longer painted in the colour of an error.** Locked is
+  green and unlocked amber; previously the state the app exists to produce was
+  drawn in the same red as a failure. Status colours are resolved per theme, so
+  they stay legible in both light and dark mode instead of using pure
+  `#00FF00` / `#FF0000`.
+- File rows are painted in fixed columns — icon, name, size, state — instead of
+  being one string joined with runs of spaces, which left nothing lined up down
+  the list.
+- The toolbar keeps one vault control that reads Lock or Unlock; changing the
+  master password and switching theme moved into Settings, and the redundant
+  Exit button is gone. The window has a minimum size.
+- Text, spacing and corner rounding are set once at startup rather than running
+  on egui's stock style, which is tuned for dense debug panels. The palette is
+  now rebuilt only when the theme changes — doing it every frame discarded
+  anything layered on top of it.
 - Upgraded eframe/egui from 0.27 to 0.32.
 - `config::save_config` takes a single `&Config` instead of a long positional
   argument list, so adding a setting no longer changes its signature.
