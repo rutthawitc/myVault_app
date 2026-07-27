@@ -44,9 +44,60 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             install_unicode_font(&cc.egui_ctx);
+            configure_style(&cc.egui_ctx);
             Ok(Box::new(MyVaultApp::new()))
         }),
     )
+}
+
+/// Loosen up egui's defaults, which are tuned for dense debug UIs.
+///
+/// Spacing and text sizes live in `Style` and survive the per-theme
+/// `set_visuals` call, so this only has to run once at startup.
+fn configure_style(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.interact_size.y = 26.0;
+        style.spacing.menu_margin = egui::Margin::same(6);
+
+        // The stock 12.5pt body text is small for a file list read at arm's length.
+        for (text_style, size) in [
+            (egui::TextStyle::Body, 14.0),
+            (egui::TextStyle::Button, 14.0),
+            (egui::TextStyle::Heading, 20.0),
+        ] {
+            if let Some(font) = style.text_styles.get_mut(&text_style) {
+                font.size = size;
+            }
+        }
+    });
+}
+
+/// Apply the light/dark palette, with the app's own corner rounding on top.
+///
+/// `set_visuals` replaces the whole palette, so the rounding has to be reapplied
+/// with it - but only when the theme actually changes, not every frame.
+fn apply_theme(ctx: &egui::Context, dark_mode: bool) {
+    let mut visuals = if dark_mode {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(5);
+    }
+
+    ctx.set_visuals(visuals);
 }
 
 /// Add a system font that covers Thai to the font stack.
@@ -177,6 +228,11 @@ struct MyVaultApp {
     new_password: String,
     new_password_confirm: String,
     dark_mode: bool,  // Phase 1: Dark mode toggle
+    /// Which theme is currently installed, so it is only rebuilt when it changes.
+    applied_dark_mode: Option<bool>,
+    /// Reveal the characters in the password fields of the open dialog.
+    /// Always reset to false when a dialog closes.
+    reveal_passwords: bool,
     // Phase 2: UX Improvements
     search_filter: String,
     recent_files: Vec<PathBuf>,
@@ -235,6 +291,8 @@ impl MyVaultApp {
             new_password: String::new(),
             new_password_confirm: String::new(),
             dark_mode: false,  // Default to light mode
+            applied_dark_mode: None,
+            reveal_passwords: false,
             // Phase 2: UX Improvements
             search_filter: String::new(),
             recent_files: Vec::new(),
@@ -302,6 +360,7 @@ impl MyVaultApp {
     /// no path can leave a password sitting in memory.
     fn close_password_dialog(&mut self) {
         self.show_password_dialog = false;
+        self.reveal_passwords = false;
         self.temp_password.zeroize();
         self.temp_password.clear();
         self.temp_password_confirm.zeroize();
@@ -311,6 +370,7 @@ impl MyVaultApp {
     /// Same, for the change-password dialog.
     fn close_change_password_dialog(&mut self) {
         self.show_change_password_dialog = false;
+        self.reveal_passwords = false;
         self.current_password.zeroize();
         self.current_password.clear();
         self.new_password.zeroize();
@@ -1020,11 +1080,11 @@ impl MyVaultApp {
 
 impl eframe::App for MyVaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Phase 1: Apply dark mode theme
-        if self.dark_mode {
-            ctx.set_visuals(egui::Visuals::dark());
-        } else {
-            ctx.set_visuals(egui::Visuals::light());
+        // Phase 1: Apply dark mode theme. Only on change - rebuilding the whole
+        // palette every frame threw away any styling applied on top of it.
+        if self.applied_dark_mode != Some(self.dark_mode) {
+            apply_theme(ctx, self.dark_mode);
+            self.applied_dark_mode = Some(self.dark_mode);
         }
 
         // Phase 3: Session timeout check.
@@ -1748,28 +1808,9 @@ impl eframe::App for MyVaultApp {
                             ListRow::Item { idx, item } => {
                                 let idx = *idx;
                                 let is_selected = self.selected.contains(&idx);
-                                let file_name = item.original_path.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy();
-                                let file_size = format_file_size(item.size);
-                                let label = format!(
-                                    "     {}  {}  {}  {} {}",
-                                    match item.item_type { ItemType::File => "└", ItemType::Folder => "📁" },
-                                    file_name,
-                                    file_size,
-                                    if item.is_locked { "Locked" } else { "Unlocked" },
-                                    if item.is_locked { "🔒" } else { "🔓" }
-                                );
-
-                                // Color locked items in red for easy visual distinction
-                                let label_text = if item.is_locked {
-                                    egui::RichText::new(label).color(egui::Color32::from_rgb(220, 50, 50))
-                                } else {
-                                    egui::RichText::new(label)
-                                };
 
                                 // Multi-select with Cmd/Ctrl+click and Shift+click for range selection
-                                if ui.selectable_label(is_selected, label_text).clicked() {
+                                if file_row(ui, item, is_selected, row_height).clicked() {
                                     let modifiers = ui.ctx().input(|i| i.modifiers);
                                     if modifiers.shift {
                                         // Range select with Shift held, walking the rows as
@@ -1806,11 +1847,13 @@ impl eframe::App for MyVaultApp {
                 // Whether the vault is open, and how long it stays open, were both
                 // invisible - the only clue was whether the file list was greyed out.
                 if self.authenticated {
-                    ui.colored_label(egui::Color32::from_rgb(60, 160, 90), "🔓 Unlocked");
+                    // An open vault is the state worth noticing, hence Warn, not Good:
+                    // "unlocked" is exactly when the files are exposed.
+                    ui.colored_label(tone_color(ui, Tone::Warn), "🔓 Unlocked");
                     if let Some(remaining) = self.auto_lock_remaining() {
                         // Warn once the window is short enough to matter.
                         let color = if remaining <= 60 {
-                            egui::Color32::from_rgb(200, 120, 40)
+                            tone_color(ui, Tone::Bad)
                         } else {
                             ui.visuals().weak_text_color()
                         };
@@ -1826,7 +1869,7 @@ impl eframe::App for MyVaultApp {
                         );
                     }
                 } else {
-                    ui.colored_label(ui.visuals().weak_text_color(), "🔒 Locked");
+                    ui.colored_label(tone_color(ui, Tone::Good), "🔒 Locked");
                 }
                 ui.separator();
 
@@ -1834,9 +1877,9 @@ impl eframe::App for MyVaultApp {
                 let err = msg.contains("error") || msg.contains("Error") || msg.contains("Invalid") || msg.contains("failed") || msg.contains("Failed");
                 let ok = msg.contains("Locked") || msg.contains("Unlocked") || msg.contains("Authenticated") || msg.contains("Loaded") || msg.contains("Added") || msg.contains("created") || msg.contains("Removed");
                 let color = if err {
-                    egui::Color32::RED
+                    tone_color(ui, Tone::Bad)
                 } else if ok {
-                    egui::Color32::GREEN
+                    tone_color(ui, Tone::Good)
                 } else {
                     ui.visuals().text_color()
                 };
@@ -1865,55 +1908,32 @@ impl eframe::App for MyVaultApp {
 
                         if has_hash {
                             ui.label("Enter your master password:");
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.temp_password)
-                                    .password(true)
-                                    .hint_text("Password"),
+                            let resp = password_field(
+                                ui,
+                                &mut self.temp_password,
+                                "Password",
+                                &mut self.reveal_passwords,
                             );
                             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 enter_pressed = true;
                             }
                         } else {
                             ui.label("Create a master password (store it safely):");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.temp_password)
-                                    .password(true)
-                                    .hint_text("Password"),
+                            password_field(
+                                ui,
+                                &mut self.temp_password,
+                                "Password",
+                                &mut self.reveal_passwords,
                             );
 
                             // Phase 1: Password strength meter
-                            let (strength_level, strength_color, strength_label) = assess_password_strength(&self.temp_password);
-                            if !self.temp_password.is_empty() {
-                                ui.horizontal(|ui| {
-                                    ui.label("Strength:");
-                                    // Visual strength bar
-                                    let bar_width = 150.0;
-                                    let bar_height = 8.0;
-                                    let filled_width = bar_width * ((strength_level + 1) as f32 / 3.0);
+                            strength_meter(ui, &self.temp_password, 150.0);
 
-                                    let (rect, _response) = ui.allocate_exact_size(
-                                        egui::vec2(bar_width, bar_height),
-                                        egui::Sense::hover()
-                                    );
-
-                                    // Draw background
-                                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(50));
-
-                                    // Draw filled portion
-                                    let filled_rect = egui::Rect::from_min_size(
-                                        rect.min,
-                                        egui::vec2(filled_width, bar_height)
-                                    );
-                                    ui.painter().rect_filled(filled_rect, 2.0, strength_color);
-
-                                    ui.colored_label(strength_color, strength_label);
-                                });
-                            }
-
-                            let confirm_resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.temp_password_confirm)
-                                    .password(true)
-                                    .hint_text("Confirm password"),
+                            let confirm_resp = password_field(
+                                ui,
+                                &mut self.temp_password_confirm,
+                                "Confirm password",
+                                &mut self.reveal_passwords,
                             );
                             // Auto-submit on Enter in confirm field
                             if confirm_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -2022,55 +2042,32 @@ impl eframe::App for MyVaultApp {
                     let mut enter_pressed = false;
 
                     ui.label("Current password:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.current_password)
-                            .password(true)
-                            .hint_text("Current password"),
+                    password_field(
+                        ui,
+                        &mut self.current_password,
+                        "Current password",
+                        &mut self.reveal_passwords,
                     );
 
                     ui.separator();
 
                     ui.label("New password:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_password)
-                            .password(true)
-                            .hint_text("New password"),
+                    password_field(
+                        ui,
+                        &mut self.new_password,
+                        "New password",
+                        &mut self.reveal_passwords,
                     );
 
                     // Phase 1: Password strength meter for new password
-                    let (strength_level, strength_color, strength_label) = assess_password_strength(&self.new_password);
-                    if !self.new_password.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label("Strength:");
-                            // Visual strength bar
-                            let bar_width = 150.0;
-                            let bar_height = 8.0;
-                            let filled_width = bar_width * ((strength_level + 1) as f32 / 3.0);
-
-                            let (rect, _response) = ui.allocate_exact_size(
-                                egui::vec2(bar_width, bar_height),
-                                egui::Sense::hover()
-                            );
-
-                            // Draw background
-                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(50));
-
-                            // Draw filled portion
-                            let filled_rect = egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(filled_width, bar_height)
-                            );
-                            ui.painter().rect_filled(filled_rect, 2.0, strength_color);
-
-                            ui.colored_label(strength_color, strength_label);
-                        });
-                    }
+                    strength_meter(ui, &self.new_password, 150.0);
 
                     ui.label("Confirm new password:");
-                    let confirm_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.new_password_confirm)
-                            .password(true)
-                            .hint_text("Confirm new password"),
+                    let confirm_resp = password_field(
+                        ui,
+                        &mut self.new_password_confirm,
+                        "Confirm new password",
+                        &mut self.reveal_passwords,
                     );
                     // Auto-submit on Enter in confirm field
                     if confirm_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -2283,28 +2280,9 @@ impl eframe::App for MyVaultApp {
                             }
                         });
 
-                        // Password strength indicator
-                        let (strength_level, strength_color, strength_label) = assess_password_strength(&self.generated_password);
-                        ui.horizontal(|ui| {
-                            ui.label("Strength:");
-                            let bar_width = 200.0;
-                            let bar_height = 8.0;
-                            let filled_width = (bar_width * strength_level as f32) / 100.0;
-
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(bar_width, bar_height),
-                                egui::Sense::hover()
-                            );
-
-                            ui.painter().rect_filled(rect, 4.0, egui::Color32::DARK_GRAY);
-                            let filled_rect = egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(filled_width, bar_height)
-                            );
-                            ui.painter().rect_filled(filled_rect, 4.0, strength_color);
-
-                            ui.label(egui::RichText::new(strength_label).color(strength_color));
-                        });
+                        // Password strength indicator. This one used to divide the
+                        // level by 100, so the bar never filled past a sliver.
+                        strength_meter(ui, &self.generated_password, 200.0);
                     }
 
                     ui.separator();
@@ -2629,6 +2607,44 @@ impl eframe::App for MyVaultApp {
     }
 }
 
+/// Semantic meaning of a piece of coloured text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    /// Something is safe or succeeded. Encrypted files are Good, not Bad -
+    /// a locked file is the desired state, not an error.
+    Good,
+    /// Something needs attention but is not broken: a plaintext file, a
+    /// middling password, a session about to expire.
+    Warn,
+    /// A failure.
+    Bad,
+}
+
+/// Resolve a tone to a colour that is legible on the current background.
+///
+/// `Color32::GREEN` and `Color32::RED` are pure #00FF00 / #FF0000 - they glare on
+/// a dark background and wash out to near-invisible on a light one. These are
+/// picked per theme instead.
+fn tone_color(ui: &egui::Ui, tone: Tone) -> egui::Color32 {
+    let dark = ui.visuals().dark_mode;
+    match (tone, dark) {
+        (Tone::Good, false) => egui::Color32::from_rgb(21, 115, 71),
+        (Tone::Good, true) => egui::Color32::from_rgb(94, 200, 140),
+        (Tone::Warn, false) => egui::Color32::from_rgb(150, 90, 10),
+        (Tone::Warn, true) => egui::Color32::from_rgb(230, 170, 60),
+        (Tone::Bad, false) => egui::Color32::from_rgb(176, 42, 42),
+        (Tone::Bad, true) => egui::Color32::from_rgb(240, 115, 115),
+    }
+}
+
+/// How much of the password-strength bar to fill, for a level of 0..=2.
+///
+/// Shared by all three strength meters. One of them used to divide the level by
+/// 100 instead, so its bar sat at 2% however strong the password was.
+fn strength_fill(level: u8) -> f32 {
+    ((level.min(2) as f32) + 1.0) / 3.0
+}
+
 /// Case-insensitive substring match of a path against the search box.
 /// An empty filter matches everything.
 fn path_matches_filter(path: &Path, filter: &str) -> bool {
@@ -2686,9 +2702,9 @@ fn format_file_size(size: Option<u64>) -> String {
 /// - Level 0 (Weak): < 8 chars or simple patterns
 /// - Level 1 (Medium): 8-11 chars with some complexity
 /// - Level 2 (Strong): 12+ chars with high complexity
-fn assess_password_strength(password: &str) -> (u8, egui::Color32, &'static str) {
+fn assess_password_strength(password: &str) -> (u8, Tone, &'static str) {
     if password.is_empty() {
-        return (0, egui::Color32::GRAY, "");
+        return (0, Tone::Bad, "");
     }
 
     let len = password.len();
@@ -2720,14 +2736,79 @@ fn assess_password_strength(password: &str) -> (u8, egui::Color32, &'static str)
 
     // Scoring logic
     if len < 8 || is_sequential || is_repetitive {
-        (0, egui::Color32::from_rgb(220, 53, 69), "Weak")
+        (0, Tone::Bad, "Weak")
     } else if len >= 12 && complexity >= 3 {
-        (2, egui::Color32::from_rgb(40, 167, 69), "Strong")
+        (2, Tone::Good, "Strong")
     } else if len >= 8 && complexity >= 2 {
-        (1, egui::Color32::from_rgb(255, 193, 7), "Medium")
+        (1, Tone::Warn, "Medium")
     } else {
-        (0, egui::Color32::from_rgb(220, 53, 69), "Weak")
+        (0, Tone::Bad, "Weak")
     }
+}
+
+/// The password-strength meter: label, bar and verdict.
+///
+/// One widget for all three dialogs. They each had their own copy of the drawing
+/// code, which is how one of them ended up with a bar that never filled and all
+/// three ended up with a hard-coded dark bar track that looked wrong in light mode.
+fn strength_meter(ui: &mut egui::Ui, password: &str, bar_width: f32) {
+    if password.is_empty() {
+        return;
+    }
+    let (level, tone, label) = assess_password_strength(password);
+    let color = tone_color(ui, tone);
+
+    ui.horizontal(|ui| {
+        ui.label("Strength:");
+
+        let bar_height = 8.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(bar_width, bar_height),
+            egui::Sense::hover(),
+        );
+
+        // Track colour comes from the theme so it works in both modes.
+        ui.painter()
+            .rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+
+        let filled = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2(bar_width * strength_fill(level), bar_height),
+        );
+        ui.painter().rect_filled(filled, 3.0, color);
+
+        ui.colored_label(color, label);
+    });
+}
+
+/// A password field with a reveal toggle.
+///
+/// Typing a long generated password blind, twice, with no way to check it, was
+/// the previous experience.
+fn password_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    reveal: &mut bool,
+) -> egui::Response {
+    let mut response = None;
+    ui.horizontal(|ui| {
+        response = Some(ui.add(
+            egui::TextEdit::singleline(value)
+                .password(!*reveal)
+                .hint_text(hint)
+                .desired_width(ui.available_width() - 34.0),
+        ));
+        let (icon, tip) = if *reveal {
+            ("🔓", "Hide password")
+        } else {
+            ("👁", "Show password")
+        };
+        if ui.small_button(icon).on_hover_text(tip).clicked() {
+            *reveal = !*reveal;
+        }
+    });
+    response.expect("the horizontal layout always runs")
 }
 
 #[derive(Debug)]
@@ -2765,6 +2846,100 @@ enum ListRow<'a> {
     },
     /// One vault item, drawn under the heading above it.
     Item { idx: usize, item: &'a VaultItem },
+}
+
+/// Draw one file row: icon, name, size, lock state - in fixed columns.
+///
+/// The row used to be a single string padded with spaces, so the size and status
+/// columns wandered left and right with the length of each filename. Here the
+/// whole row is one clickable area with the pieces painted at fixed offsets, which
+/// also keeps every row exactly `row_height` tall - the scroll area depends on that
+/// to skip the rows that are off screen.
+fn file_row(
+    ui: &mut egui::Ui,
+    item: &VaultItem,
+    selected: bool,
+    row_height: f32,
+) -> egui::Response {
+    const INDENT: f32 = 18.0; // sits under its folder heading
+    const PAD: f32 = 8.0;
+    const ICON_W: f32 = 24.0;
+    const SIZE_W: f32 = 90.0;
+    const STATUS_W: f32 = 104.0;
+
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+
+        if selected || response.hovered() {
+            ui.painter()
+                .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+        }
+
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let text_color = visuals.text_color();
+
+        // Locked means "protected", so it reads as good. Unlocked is the state
+        // that deserves attention - the previous colouring had this backwards,
+        // painting every encrypted file in error red.
+        let state_tone = if item.is_locked { Tone::Good } else { Tone::Warn };
+        let state_color = tone_color(ui, state_tone);
+
+        let icon = match item.item_type {
+            ItemType::File => "📄",
+            ItemType::Folder => "📁",
+        };
+        let icon_x = rect.left() + INDENT + PAD;
+        ui.painter().text(
+            egui::pos2(icon_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            icon,
+            font.clone(),
+            text_color,
+        );
+
+        // The name gets whatever is left, and is clipped rather than allowed to
+        // run underneath the columns to its right.
+        let name_x = icon_x + ICON_W;
+        let name_right = rect.right() - PAD - STATUS_W - SIZE_W;
+        let name_rect =
+            egui::Rect::from_x_y_ranges(name_x..=name_right.max(name_x), rect.y_range());
+        let name = item
+            .original_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        ui.painter().with_clip_rect(name_rect).text(
+            egui::pos2(name_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            font.clone(),
+            text_color,
+        );
+
+        // Sizes right-align so the digits line up down the column.
+        ui.painter().text(
+            egui::pos2(rect.right() - PAD - STATUS_W, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format_file_size(item.size),
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+
+        let state = if item.is_locked { "🔒 Locked" } else { "🔓 Unlocked" };
+        ui.painter().text(
+            egui::pos2(rect.right() - PAD, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            state,
+            font,
+            state_color,
+        );
+    }
+
+    response
 }
 
 /// Flatten the folder groups into the exact sequence of rows the list paints.
@@ -3002,6 +3177,47 @@ mod tests {
             matches!(rows[3], ListRow::Header { .. }),
             "The second group's header follows the first group's items"
         );
+    }
+
+    /// The generator's meter divided the level by 100, so its bar sat at 2% for
+    /// even a "Strong" verdict. All three meters share this now.
+    #[test]
+    fn test_strength_bar_fills_proportionally_and_maxes_out_at_strong() {
+        assert!((strength_fill(0) - 1.0 / 3.0).abs() < f32::EPSILON, "Weak fills a third");
+        assert!((strength_fill(1) - 2.0 / 3.0).abs() < f32::EPSILON, "Medium fills two thirds");
+        assert!((strength_fill(2) - 1.0).abs() < f32::EPSILON, "Strong fills the bar");
+
+        // Never overflow the track, whatever a future scorer returns.
+        assert!((strength_fill(9) - 1.0).abs() < f32::EPSILON);
+
+        assert!(strength_fill(0) < strength_fill(1) && strength_fill(1) < strength_fill(2));
+    }
+
+    /// Locked is the state the app exists to produce, so it must not be painted
+    /// in the same tone as a failure. This pins the mapping that was inverted.
+    #[test]
+    fn test_password_strength_verdicts_map_to_sensible_tones() {
+        let (_, weak_tone, weak) = assess_password_strength("abc");
+        assert_eq!(weak, "Weak");
+        assert_eq!(weak_tone, Tone::Bad);
+
+        let (_, medium_tone, medium) = assess_password_strength("password1");
+        assert_eq!(medium, "Medium");
+        assert_eq!(medium_tone, Tone::Warn);
+
+        let (level, strong_tone, strong) = assess_password_strength("Xk9#mQp2!vRt");
+        assert_eq!(strong, "Strong");
+        assert_eq!(strong_tone, Tone::Good);
+        assert_eq!(level, 2, "Strong is the top level, so the bar fills");
+    }
+
+    /// Sequential and repeated runs are downgraded no matter how long the
+    /// password is - worth pinning, since the meter is the only feedback the
+    /// user gets while choosing a master password.
+    #[test]
+    fn test_obvious_patterns_are_rated_weak_despite_length() {
+        assert_eq!(assess_password_strength("Abcdefgh123!").2, "Weak");
+        assert_eq!(assess_password_strength("Paaassword12!").2, "Weak");
     }
 
     #[test]
