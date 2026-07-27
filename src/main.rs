@@ -32,6 +32,12 @@ fn main() -> eframe::Result<()> {
 
     // Set window icon with a simple vault icon (lock emoji-based)
     options.viewport.icon = Some(std::sync::Arc::new(create_vault_icon()));
+    // The toolbar and the file list both need room. A minimum stops the window
+    // being dragged narrow enough to clip the toolbar's trailing buttons.
+    options.viewport = options
+        .viewport
+        .with_inner_size([1000.0, 700.0])
+        .with_min_inner_size([720.0, 480.0]);
 
     eframe::run_native(
         "My Vault App",
@@ -159,7 +165,10 @@ struct MyVaultApp {
     wrapped_dek: Option<String>,
     confirm_action: Option<ConfirmAction>,
     current_op: Option<BatchOp>,
-    op_result_rxs: Vec<Receiver<(PathBuf, WorkerOutcome)>>,  // One receiver per in-flight worker thread
+    /// One entry per in-flight worker: the file it is working on, and the channel
+    /// it will report back on. The path is kept so the progress window can name
+    /// what is being processed right now.
+    op_result_rxs: Vec<(PathBuf, Receiver<(PathBuf, WorkerOutcome)>)>,
     show_error_report: bool,
     last_error_report: Vec<(PathBuf, String)>,
     perf_config: PerformanceConfig,  // Dynamic performance configuration based on CPU cores
@@ -251,7 +260,72 @@ impl MyVaultApp {
             reminder_dismissed_until: None,
         };
         app.load_from_config();
+        // Nothing in the app works until the vault is unlocked, so ask straight
+        // away instead of leaving the user to find the button in the toolbar.
+        // With no vault yet this is the "create a master password" prompt.
+        app.show_password_dialog = true;
         app
+    }
+
+    /// Is a dialog currently on screen?
+    ///
+    /// Keyboard shortcuts are suppressed while one is open, so that Escape closes
+    /// the dialog instead of also clearing the selection behind it.
+    fn any_dialog_open(&self) -> bool {
+        self.show_password_dialog
+            || self.show_change_password_dialog
+            || self.show_password_generator
+            || self.show_settings_dialog
+            || self.show_error_report
+            || self.confirm_action.is_some()
+            || self.current_op.is_some()
+    }
+
+    /// Lock the vault: drop the key and ask for the password again.
+    ///
+    /// Used by the toolbar, by Settings, and by the auto-lock timer, so all three
+    /// leave the app in exactly the same state.
+    fn lock_session(&mut self, message: &str) {
+        self.authenticated = false;
+        self.encryption_key = None;
+        // A selection made before locking should not survive into the next
+        // session and become the target of a Lock the user did not line up.
+        self.selected.clear();
+        self.last_selected = None;
+        self.status_message = message.to_string();
+        self.last_activity = Instant::now();
+        self.show_password_dialog = true;
+    }
+
+    /// Dismiss the unlock/create dialog, wiping whatever was typed into it.
+    /// Shared by the Cancel button and by Escape / clicking outside the modal, so
+    /// no path can leave a password sitting in memory.
+    fn close_password_dialog(&mut self) {
+        self.show_password_dialog = false;
+        self.temp_password.zeroize();
+        self.temp_password.clear();
+        self.temp_password_confirm.zeroize();
+        self.temp_password_confirm.clear();
+    }
+
+    /// Same, for the change-password dialog.
+    fn close_change_password_dialog(&mut self) {
+        self.show_change_password_dialog = false;
+        self.current_password.zeroize();
+        self.current_password.clear();
+        self.new_password.zeroize();
+        self.new_password.clear();
+        self.new_password_confirm.zeroize();
+        self.new_password_confirm.clear();
+    }
+
+    /// Seconds left before the session auto-locks, if auto-lock is on.
+    fn auto_lock_remaining(&self) -> Option<u64> {
+        if !self.auto_lock_enabled || !self.authenticated {
+            return None;
+        }
+        let timeout = self.session_timeout_minutes.saturating_mul(60);
+        Some(timeout.saturating_sub(self.last_activity.elapsed().as_secs()))
     }
 
     /// Set up key material for a brand-new vault.
@@ -953,16 +1027,22 @@ impl eframe::App for MyVaultApp {
             ctx.set_visuals(egui::Visuals::light());
         }
 
-        // Phase 3: Session timeout check
+        // Phase 3: Session timeout check.
+        //
+        // egui only repaints in response to input, so while the app sat untouched
+        // this check never ran - exactly the situation auto-lock exists for. Ask for
+        // a repaint every second so the timer keeps ticking (and the countdown in
+        // the status bar stays live) with nobody at the keyboard.
         if self.auto_lock_enabled && self.authenticated {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
             let elapsed_minutes = self.last_activity.elapsed().as_secs() / 60;
             if elapsed_minutes >= self.session_timeout_minutes {
-                // Auto-lock: clear authentication
-                self.authenticated = false;
-                self.encryption_key = None;
-                self.status_message = format!("🔒 Session timed out after {} minutes of inactivity. Please re-authenticate.", self.session_timeout_minutes);
-                // Reset activity timer
-                self.last_activity = Instant::now();
+                let msg = format!(
+                    "🔒 Session timed out after {} minutes of inactivity. Please re-authenticate.",
+                    self.session_timeout_minutes
+                );
+                self.lock_session(&msg);
             }
         }
 
@@ -974,8 +1054,9 @@ impl eframe::App for MyVaultApp {
         // Phase 2: Keyboard shortcuts
         // `modifiers.command` is Cmd on macOS and Ctrl everywhere else. Matching on
         // `.ctrl` meant none of these shortcuts fired in the macOS build.
-        let busy = self.current_op.is_some();
-        if !busy && self.authenticated && !self.show_password_dialog && !self.show_change_password_dialog {
+        // Suppressed while any dialog is open so Escape closes the dialog rather
+        // than silently clearing the selection underneath it.
+        if self.authenticated && !self.any_dialog_open() {
             // Computed outside the input closure: `visible_indices` borrows self.
             let visible = self.visible_indices();
             ctx.input(|i| {
@@ -1049,7 +1130,7 @@ impl eframe::App for MyVaultApp {
             // Phase 3: Collect successful paths to add to recent files after retain_mut
             let mut successful_paths = Vec::new();
 
-            self.op_result_rxs.retain_mut(|rx| {
+            self.op_result_rxs.retain_mut(|(_, rx)| {
                 match rx.try_recv() {
                     Ok((path, outcome)) => {
                         match outcome {
@@ -1102,6 +1183,7 @@ impl eframe::App for MyVaultApp {
                 let (result_tx, result_rx) = mpsc::channel();
                 let op_kind = op.kind;
                 let p_clone = p.clone();
+                let p_display = p.clone();
                 let cancel = Arc::clone(&op.cancel);
                 let _perf_config = self.perf_config.clone();  // Reserved for future adaptive performance tuning
                 std::thread::spawn(move || {
@@ -1182,7 +1264,7 @@ impl eframe::App for MyVaultApp {
                 // No artificial delay here: the number of in-flight workers is already
                 // bounded by `max_parallel` (<= 4), so file descriptors cannot pile up.
                 // Sleeping on the UI thread would freeze the interface for each spawn.
-                self.op_result_rxs.push(result_rx);
+                self.op_result_rxs.push((p_display, result_rx));
             }
 
             // Complete only when scanning is done, queue is empty, AND all background threads finished
@@ -1311,26 +1393,36 @@ impl eframe::App for MyVaultApp {
             }
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // Wrapping, so narrowing the window moves buttons to a second line
+            // instead of cutting the trailing ones off.
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("My Vault App");
                 ui.separator();
-                let mp_label = if self.master_password_hash.is_some() { "Master Password" } else { "Create Master Password" };
-                if ui.button(mp_label).clicked() {
-                    self.show_password_dialog = true;
-                }
-                // Add Change Password button (only show if password is already set and authenticated)
-                if self.master_password_hash.is_some() && self.authenticated
-                    && ui.button("Change Password").clicked() {
-                        self.show_change_password_dialog = true;
+
+                // One primary control for the vault: unlock it, or lock it again.
+                // Changing the password and switching theme moved into Settings -
+                // they were competing for space with the things used every session.
+                if self.authenticated {
+                    if ui.button("🔒 Lock Vault")
+                        .on_hover_text("Lock the vault now and clear the key from memory")
+                        .clicked()
+                    {
+                        self.lock_session("🔒 Vault locked");
                     }
-                ui.separator();
-                // Phase 1: Dark mode toggle
-                let theme_label = if self.dark_mode { "☀ Light Mode" } else { "🌙 Dark Mode" };
-                if ui.button(theme_label).clicked() {
-                    self.dark_mode = !self.dark_mode;
+                } else {
+                    let mp_label = if self.master_password_hash.is_some() {
+                        "🔓 Unlock Vault"
+                    } else {
+                        "Create Master Password"
+                    };
+                    if ui.button(mp_label).clicked() {
+                        self.show_password_dialog = true;
+                    }
                 }
+
+                ui.separator();
                 // Phase 3: Settings button
-                if ui.button("⚙ Settings").on_hover_text("Configure app settings").clicked() {
+                if ui.button("⚙ Settings").on_hover_text("Theme, auto-lock, master password").clicked() {
                     self.show_settings_dialog = true;
                 }
 
@@ -1361,12 +1453,6 @@ impl eframe::App for MyVaultApp {
                         }
                     }
                 });
-
-                // Exit button
-                ui.separator();
-                if ui.button("❌ Exit").on_hover_text("Close application").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
             });
         });
 
@@ -1425,11 +1511,15 @@ impl eframe::App for MyVaultApp {
 
             ui.horizontal(|ui| {
                 let busy = self.current_op.is_some();
-                if ui.add_enabled(!busy, egui::Button::new("Add File"))
-                    .on_hover_text("Add a single file to encrypt/decrypt")
+                if ui.add_enabled(!busy, egui::Button::new("Add Files"))
+                    .on_hover_text("Add one or more files to encrypt/decrypt")
                     .clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.add_path(path, ItemType::File);
+                    // Multi-select: adding a folder's worth of files one dialog at
+                    // a time was the only way to do this before.
+                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                        for path in paths {
+                            self.add_path(path, ItemType::File);
+                        }
                     }
                 }
                 if ui.add_enabled(!busy, egui::Button::new("Add Folder"))
@@ -1525,16 +1615,25 @@ impl eframe::App for MyVaultApp {
 
             ui.separator();
 
-            // Dim the files list if not authenticated. `disable()` applies to
-            // everything added to this Ui from here on.
-            let enabled = self.authenticated;
-            if !enabled {
-                ui.disable();
-            }
-
-            // Show placeholder message if not authenticated
-            if !enabled {
-                ui.heading("🔒 Please enter password to view files");
+            // Locked vault: offer the way back in right here, rather than a dead
+            // heading that leaves the user hunting the toolbar for the button.
+            if !self.authenticated {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("🔒 Vault is locked");
+                    ui.add_space(4.0);
+                    ui.label("Unlock the vault to see and manage your files.");
+                    ui.add_space(12.0);
+                    let label = if self.master_password_hash.is_some() {
+                        "🔓 Unlock Vault"
+                    } else {
+                        "Create Master Password"
+                    };
+                    if ui.button(egui::RichText::new(label).size(16.0)).clicked() {
+                        self.show_password_dialog = true;
+                    }
+                });
+                return;
             }
 
             // Phase 2: Drag and drop support (detect at panel level, before borrowing items)
@@ -1603,91 +1702,100 @@ impl eframe::App for MyVaultApp {
                 .flat_map(|items| items.iter().map(|(idx, _)| *idx))
                 .collect();
 
+            // Show message if filtering resulted in empty list
+            if display_items.is_empty() && !self.items.is_empty() {
+                ui.label("No items match the search filter");
+            } else if self.items.is_empty() {
+                ui.label("No files added yet. Use buttons above or drag & drop files here.");
+            }
+
+            // Flatten the folder groups into one uniform-height row list. This is what
+            // lets the scroll area skip rows that are off-screen: previously every row
+            // of the vault was laid out on every frame, whether or not it was visible.
+            let rows = flatten_rows(&groups);
+
+            // Must match what `selectable_label` actually allocates, or the scroll
+            // area's virtual height drifts away from the real content.
+            let row_height = (ui.text_style_height(&egui::TextStyle::Body)
+                + 2.0 * ui.spacing().button_padding.y)
+                .max(ui.spacing().interact_size.y);
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
-                .show(ui, |ui| {
+                .show_rows(ui, row_height, rows.len(), |ui, range| {
                     ui.set_width(ui.available_width());
-                    // Show message if filtering resulted in empty list
-                    if display_items.is_empty() && !self.items.is_empty() {
-                        ui.label("No items match the search filter");
-                    } else if self.items.is_empty() {
-                        ui.label("No files added yet. Use buttons above or drag & drop files here.");
-                    }
 
-                    // Render grouped file list
-                    for (parent_dir, items) in groups.iter() {
-                        // Check if all files in this folder are selected
-                        let all_selected = !items.is_empty() && items.iter().all(|(idx, _)| self.selected.contains(idx));
-                        let folder_header_label = egui::RichText::new(format!("📁 {}", parent_dir.display())).strong();
+                    for row in &rows[range] {
+                        match row {
+                            ListRow::Header { dir, members } => {
+                                // Clicking a folder header selects or clears everything under it
+                                let all_selected = !members.is_empty()
+                                    && members.iter().all(|(idx, _)| self.selected.contains(idx));
+                                let label =
+                                    egui::RichText::new(format!("📁 {}", dir.display())).strong();
 
-                        // Make folder header clickable to select/deselect entire folder
-                        if ui.selectable_label(all_selected, folder_header_label).clicked() {
-                            // Toggle selection of all files in this folder
-                            if all_selected {
-                                // Deselect all files in this folder
-                                for (idx, _) in items.iter() {
-                                    self.selected.remove(idx);
-                                }
-                            } else {
-                                // Select all files in this folder
-                                for (idx, _) in items.iter() {
-                                    self.selected.insert(*idx);
+                                if ui.selectable_label(all_selected, label).clicked() {
+                                    for (idx, _) in members.iter() {
+                                        if all_selected {
+                                            self.selected.remove(idx);
+                                        } else {
+                                            self.selected.insert(*idx);
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        // Render files under this folder (indented)
-                        for (idx, item) in items.iter() {
-                            let is_selected = self.selected.contains(idx);
-                            let file_name = item.original_path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy();
-                            let file_size = format_file_size(item.size);
-                            let label = format!(
-                                "     {}  {}  {}  {} {}",
-                                match item.item_type { ItemType::File => "└", ItemType::Folder => "📁" },
-                                file_name,
-                                file_size,
-                                if item.is_locked { "Locked" } else { "Unlocked" },
-                                if item.is_locked { "🔒" } else { "🔓" }
-                            );
+                            ListRow::Item { idx, item } => {
+                                let idx = *idx;
+                                let is_selected = self.selected.contains(&idx);
+                                let file_name = item.original_path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy();
+                                let file_size = format_file_size(item.size);
+                                let label = format!(
+                                    "     {}  {}  {}  {} {}",
+                                    match item.item_type { ItemType::File => "└", ItemType::Folder => "📁" },
+                                    file_name,
+                                    file_size,
+                                    if item.is_locked { "Locked" } else { "Unlocked" },
+                                    if item.is_locked { "🔒" } else { "🔓" }
+                                );
 
-                            // Color locked items in red for easy visual distinction
-                            let label_text = if item.is_locked {
-                                egui::RichText::new(label).color(egui::Color32::from_rgb(220, 50, 50))
-                            } else {
-                                egui::RichText::new(label)
-                            };
-
-                            // Multi-select with Ctrl+click and Shift+click for range selection
-                            if ui.selectable_label(is_selected, label_text).clicked() {
-                                let modifiers = ui.ctx().input(|i| i.modifiers);
-                                if modifiers.shift {
-                                    // Range select with Shift held, walking the rows as
-                                    // they are drawn so the selection matches what the
-                                    // user sees highlighted.
-                                    for v in shift_range(&visual_order, self.last_selected, *idx) {
-                                        self.selected.insert(v);
-                                    }
-                                    self.last_selected = Some(*idx);
-                                } else if modifiers.command {
-                                    // Toggle with Ctrl held
-                                    if is_selected {
-                                        self.selected.remove(idx);
-                                    } else {
-                                        self.selected.insert(*idx);
-                                    }
-                                    self.last_selected = Some(*idx);
+                                // Color locked items in red for easy visual distinction
+                                let label_text = if item.is_locked {
+                                    egui::RichText::new(label).color(egui::Color32::from_rgb(220, 50, 50))
                                 } else {
-                                    // Single select without modifiers
-                                    self.selected.clear();
-                                    self.selected.insert(*idx);
-                                    self.last_selected = Some(*idx);
+                                    egui::RichText::new(label)
+                                };
+
+                                // Multi-select with Cmd/Ctrl+click and Shift+click for range selection
+                                if ui.selectable_label(is_selected, label_text).clicked() {
+                                    let modifiers = ui.ctx().input(|i| i.modifiers);
+                                    if modifiers.shift {
+                                        // Range select with Shift held, walking the rows as
+                                        // they are drawn so the selection matches what the
+                                        // user sees highlighted.
+                                        for v in shift_range(&visual_order, self.last_selected, idx) {
+                                            self.selected.insert(v);
+                                        }
+                                        self.last_selected = Some(idx);
+                                    } else if modifiers.command {
+                                        // Toggle with Cmd/Ctrl held
+                                        if is_selected {
+                                            self.selected.remove(&idx);
+                                        } else {
+                                            self.selected.insert(idx);
+                                        }
+                                        self.last_selected = Some(idx);
+                                    } else {
+                                        // Single select without modifiers
+                                        self.selected.clear();
+                                        self.selected.insert(idx);
+                                        self.last_selected = Some(idx);
+                                    }
                                 }
                             }
                         }
-
-                        ui.add_space(8.0);  // Space between folder groups
                     }
             });
 
@@ -1695,6 +1803,33 @@ impl eframe::App for MyVaultApp {
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Whether the vault is open, and how long it stays open, were both
+                // invisible - the only clue was whether the file list was greyed out.
+                if self.authenticated {
+                    ui.colored_label(egui::Color32::from_rgb(60, 160, 90), "🔓 Unlocked");
+                    if let Some(remaining) = self.auto_lock_remaining() {
+                        // Warn once the window is short enough to matter.
+                        let color = if remaining <= 60 {
+                            egui::Color32::from_rgb(200, 120, 40)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        ui.colored_label(
+                            color,
+                            format!("· auto-lock in {}:{:02}", remaining / 60, remaining % 60),
+                        )
+                        .on_hover_text("Any activity resets this timer. Configure it in Settings.");
+                    } else {
+                        ui.colored_label(
+                            ui.visuals().weak_text_color(),
+                            "· auto-lock off",
+                        );
+                    }
+                } else {
+                    ui.colored_label(ui.visuals().weak_text_color(), "🔒 Locked");
+                }
+                ui.separator();
+
                 let msg = self.status_message.as_str();
                 let err = msg.contains("error") || msg.contains("Error") || msg.contains("Invalid") || msg.contains("failed") || msg.contains("Failed");
                 let ok = msg.contains("Locked") || msg.contains("Unlocked") || msg.contains("Authenticated") || msg.contains("Loaded") || msg.contains("Added") || msg.contains("created") || msg.contains("Removed");
@@ -1714,15 +1849,16 @@ impl eframe::App for MyVaultApp {
             });
         });
 
-        // Modal-like password dialog
+        // Password dialog. A real modal: it dims and blocks the rest of the UI,
+        // and Escape or a click outside dismisses it.
         if self.show_password_dialog {
             let has_hash = self.master_password_hash.is_some();
             let title = if has_hash { "Enter Master Password" } else { "Create Master Password" };
-            egui::Window::new(title)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            let modal = egui::Modal::new(egui::Id::new("password_dialog"))
                 .show(ctx, |ui| {
+                    ui.set_width(340.0);
+                    ui.heading(title);
+                    ui.separator();
                     ui.vertical(|ui| {
                         // Track if Enter key was pressed for auto-submit
                         let mut enter_pressed = false;
@@ -1793,11 +1929,7 @@ impl eframe::App for MyVaultApp {
                                 }
 
                             if ui.button("Cancel").clicked() {
-                                self.show_password_dialog = false;
-                                self.temp_password.zeroize();
-                                self.temp_password.clear();
-                                self.temp_password_confirm.zeroize();
-                                self.temp_password_confirm.clear();
+                                self.close_password_dialog();
                             }
 
                             if has_hash {
@@ -1873,15 +2005,19 @@ impl eframe::App for MyVaultApp {
                         });
                     });
                 });
+            if modal.should_close() {
+                self.close_password_dialog();
+            }
         }
 
         // Change password dialog (only show when authenticated)
         if self.show_change_password_dialog && self.authenticated {
-            egui::Window::new("Change Master Password")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            let modal = egui::Modal::new(egui::Id::new("change_password_dialog"))
                 .show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.heading("Change Master Password");
+                    ui.separator();
+
                     // Track if Enter key was pressed for auto-submit
                     let mut enter_pressed = false;
 
@@ -1949,13 +2085,7 @@ impl eframe::App for MyVaultApp {
                         }
 
                         if ui.button("Cancel").clicked() {
-                            self.show_change_password_dialog = false;
-                            self.current_password.zeroize();
-                            self.current_password.clear();
-                            self.new_password.zeroize();
-                            self.new_password.clear();
-                            self.new_password_confirm.zeroize();
-                            self.new_password_confirm.clear();
+                            self.close_change_password_dialog();
                         }
 
                         // Trigger password change on button click OR Enter key
@@ -2021,15 +2151,35 @@ impl eframe::App for MyVaultApp {
                         }
                     });
                 });
+            if modal.should_close() {
+                self.close_change_password_dialog();
+            }
         }
 
         // Phase 3: Settings dialog
         if self.show_settings_dialog {
-            egui::Window::new("⚙ Settings")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            let modal = egui::Modal::new(egui::Id::new("settings_dialog"))
                 .show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.heading("⚙ Settings");
+                    ui.separator();
+
+                    // Appearance and the master password moved here from the toolbar,
+                    // which was competing for width with the everyday controls.
+                    ui.label("Appearance:");
+                    let theme_label = if self.dark_mode { "☀ Switch to Light Mode" } else { "🌙 Switch to Dark Mode" };
+                    if ui.button(theme_label).clicked() {
+                        self.dark_mode = !self.dark_mode;
+                    }
+
+                    if self.master_password_hash.is_some() && self.authenticated
+                        && ui.button("🔑 Change Master Password").clicked() {
+                            self.show_change_password_dialog = true;
+                            self.show_settings_dialog = false;
+                            self.save_config();
+                        }
+
+                    ui.separator();
                     ui.heading("Security Settings");
                     ui.separator();
 
@@ -2066,10 +2216,9 @@ impl eframe::App for MyVaultApp {
                     // Manual Lock button
                     if self.authenticated
                         && ui.button("🔒 Lock Now").clicked() {
-                            self.authenticated = false;
-                            self.encryption_key = None;
-                            self.status_message = "🔒 Session locked manually".to_string();
                             self.show_settings_dialog = false;
+                            self.save_config();
+                            self.lock_session("🔒 Session locked manually");
                         }
 
                     ui.separator();
@@ -2080,16 +2229,18 @@ impl eframe::App for MyVaultApp {
                         self.save_config(); // Save settings
                     }
                 });
+            if modal.should_close() {
+                self.show_settings_dialog = false;
+                self.save_config();
+            }
         }
 
         // Phase 3: Password Generator dialog
         if self.show_password_generator {
-            egui::Window::new("🔐 Password Generator")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            let modal = egui::Modal::new(egui::Id::new("password_generator"))
                 .show(ctx, |ui| {
-                    ui.heading("Generate Secure Password");
+                    ui.set_width(400.0);
+                    ui.heading("🔐 Generate Secure Password");
                     ui.separator();
 
                     // Length slider
@@ -2179,22 +2330,26 @@ impl eframe::App for MyVaultApp {
                         }
                     });
                 });
+            if modal.should_close() {
+                self.show_password_generator = false;
+            }
         }
 
         // Confirmation dialog for lock/unlock/remove/overwrite
         if !self.show_password_dialog && !self.show_change_password_dialog {
             if let Some(action) = self.confirm_action.clone() {
                 let title = match action {
-                    ConfirmAction::Lock => "Confirm Lock".to_string(),
-                    ConfirmAction::Unlock => "Confirm Unlock".to_string(),
-                    ConfirmAction::Remove => "Confirm Remove".to_string(),
-                    ConfirmAction::HideFolderWithFailures { .. } => "Hide Folders with Failures".to_string(),
+                    ConfirmAction::Lock => "Confirm Lock",
+                    ConfirmAction::Unlock => "Confirm Unlock",
+                    ConfirmAction::Remove => "Confirm Remove",
+                    ConfirmAction::HideFolderWithFailures { .. } => "Hide Folders with Failures",
                 };
-                egui::Window::new(title)
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                let modal = egui::Modal::new(egui::Id::new("confirm_dialog"))
                     .show(ctx, |ui| {
+                        ui.set_width(460.0);
+                        ui.heading(title);
+                        ui.separator();
+
                         match action {
                             ConfirmAction::HideFolderWithFailures { ref folder_indices, total_files, failed_files } => {
                                 ui.label(format!(
@@ -2279,6 +2434,11 @@ impl eframe::App for MyVaultApp {
                             }
                         }
                     });
+                // Escape or a click outside means "do not do it" - the safe default
+                // for every one of these actions.
+                if modal.should_close() {
+                    self.confirm_action = None;
+                }
             }
         }
 
@@ -2288,16 +2448,16 @@ impl eframe::App for MyVaultApp {
             let error_count = self.last_error_report.len();
             let errors = self.last_error_report.clone();
 
-            egui::Window::new("Error Report")
-                .collapsible(false)
-                .resizable(true)
-                .default_width(600.0)
-                .default_height(400.0)
+            let modal = egui::Modal::new(egui::Id::new("error_report"))
                 .show(ctx, |ui| {
+                    ui.set_width(640.0);
+                    ui.heading("Error Report");
+                    ui.separator();
                     ui.label(format!("Failed files: {} total errors", error_count));
                     ui.separator();
 
                     egui::ScrollArea::vertical()
+                        .max_height(360.0)
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
                             for (idx, (path, error)) in errors.iter().enumerate() {
@@ -2335,6 +2495,9 @@ impl eframe::App for MyVaultApp {
                         }
                     });
                 });
+            if modal.should_close() {
+                close_error_report = true;
+            }
         }
         if close_error_report {
             self.show_error_report = false;
@@ -2384,12 +2547,27 @@ impl eframe::App for MyVaultApp {
                 (0.0, format!("Scanning... processed {} (+{} queued), {} errors", processed, queue_len, failures), String::new())
             };
             let title = match kind { BatchOpKind::LockFolder => "Locking Folder", BatchOpKind::UnlockFolder => "Unlocking Folder" };
+            // Names of the files being worked on right now. A single huge file used to
+            // sit at 0% with no indication anything was happening.
+            let in_progress: Vec<String> = self
+                .op_result_rxs
+                .iter()
+                .map(|(path, _)| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+
             let mut cancel_clicked = false;
-            egui::Window::new(title)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            // Deliberately not dismissible with Escape: an operation is in flight and
+            // the only correct way out is the Cancel button.
+            egui::Modal::new(egui::Id::new("batch_progress"))
                 .show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.heading(title);
+                    ui.separator();
                     ui.label(&text);
                     if !eta_text.is_empty() {
                         ui.colored_label(egui::Color32::from_rgb(100, 149, 237), &eta_text);
@@ -2398,6 +2576,21 @@ impl eframe::App for MyVaultApp {
                         ui.add(egui::widgets::ProgressBar::new(progress).show_percentage());
                     } else {
                         ui.add(egui::Spinner::new());
+                    }
+
+                    if !in_progress.is_empty() {
+                        ui.add_space(4.0);
+                        let verb = match kind {
+                            BatchOpKind::LockFolder => "Encrypting",
+                            BatchOpKind::UnlockFolder => "Decrypting",
+                        };
+                        for name in &in_progress {
+                            ui.label(
+                                egui::RichText::new(format!("{} {}", verb, name))
+                                    .weak()
+                                    .small(),
+                            );
+                        }
                     }
 
                     if canceling {
@@ -2558,6 +2751,40 @@ struct BatchOp {
     /// half-written.
     cancel: Arc<AtomicBool>,
     canceling: bool,
+}
+
+/// One painted line of the file list.
+///
+/// The list is grouped by folder, but the scroll area needs a flat sequence of
+/// equal-height rows to be able to skip the ones that are off-screen.
+enum ListRow<'a> {
+    /// A folder heading. Clicking it selects or clears every member below it.
+    Header {
+        dir: &'a Path,
+        members: &'a [(usize, &'a VaultItem)],
+    },
+    /// One vault item, drawn under the heading above it.
+    Item { idx: usize, item: &'a VaultItem },
+}
+
+/// Flatten the folder groups into the exact sequence of rows the list paints.
+///
+/// The scroll area is told how many rows exist and then asked to draw only a slice
+/// of them, so this count has to match what the draw loop emits one-for-one. If it
+/// drifts, the scrollbar lies and rows go missing at the bottom of the list.
+fn flatten_rows<'a>(
+    groups: &'a BTreeMap<PathBuf, Vec<(usize, &'a VaultItem)>>,
+) -> Vec<ListRow<'a>> {
+    groups
+        .iter()
+        .flat_map(|(dir, items)| {
+            std::iter::once(ListRow::Header {
+                dir: dir.as_path(),
+                members: items.as_slice(),
+            })
+            .chain(items.iter().map(|(idx, item)| ListRow::Item { idx: *idx, item }))
+        })
+        .collect()
 }
 
 /// What a worker thread did with one file.
@@ -2723,6 +2950,64 @@ mod tests {
         assert!(path_matches_filter(path, "REPORT"), "Matching ignores case");
         assert!(path_matches_filter(path, "/tmp/vault"), "The directory is searchable too");
         assert!(!path_matches_filter(path, "invoice"), "Non-matching paths stay hidden");
+    }
+
+    fn dummy_item(path: &str) -> VaultItem {
+        VaultItem {
+            original_path: PathBuf::from(path),
+            encrypted_path: None,
+            is_locked: false,
+            item_type: ItemType::File,
+            is_folder_hidden: false,
+            size: None,
+        }
+    }
+
+    /// The virtualized list tells the scroll area a row count and then paints only a
+    /// slice. If the flattened row list and the draw loop ever disagree, the
+    /// scrollbar misreports and rows fall off the end - so pin the shape here.
+    #[test]
+    fn test_flatten_rows_emits_one_header_per_folder_plus_every_item() {
+        let a = dummy_item("/vault/docs/a.pdf");
+        let b = dummy_item("/vault/docs/b.pdf");
+        let c = dummy_item("/vault/photos/c.jpg");
+
+        let mut groups: BTreeMap<PathBuf, Vec<(usize, &VaultItem)>> = BTreeMap::new();
+        groups.insert(PathBuf::from("/vault/docs"), vec![(0, &a), (1, &b)]);
+        groups.insert(PathBuf::from("/vault/photos"), vec![(2, &c)]);
+
+        let rows = flatten_rows(&groups);
+
+        // 2 headers + 3 items
+        assert_eq!(rows.len(), 5, "Row count drives the scroll area's virtual height");
+
+        let headers = rows.iter().filter(|r| matches!(r, ListRow::Header { .. })).count();
+        assert_eq!(headers, 2, "One header per folder group");
+
+        // Items must appear under their own header, in group order.
+        let item_indices: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ListRow::Item { idx, .. } => Some(*idx),
+                ListRow::Header { .. } => None,
+            })
+            .collect();
+        assert_eq!(item_indices, vec![0, 1, 2]);
+
+        assert!(
+            matches!(rows[0], ListRow::Header { .. }),
+            "A group starts with its header"
+        );
+        assert!(
+            matches!(rows[3], ListRow::Header { .. }),
+            "The second group's header follows the first group's items"
+        );
+    }
+
+    #[test]
+    fn test_flatten_rows_of_an_empty_list_has_no_rows() {
+        let groups: BTreeMap<PathBuf, Vec<(usize, &VaultItem)>> = BTreeMap::new();
+        assert!(flatten_rows(&groups).is_empty());
     }
 
     #[test]
