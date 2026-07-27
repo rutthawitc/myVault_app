@@ -66,6 +66,10 @@ pub struct ConfigItem {
     pub item_type: ItemType,
     #[serde(default)]
     pub is_folder_hidden: bool,
+    /// Cached file size. Persisted so a locked item can still show how big it was
+    /// before it was encrypted, and so startup does not have to stat every item.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 impl From<&VaultItem> for ConfigItem {
@@ -79,6 +83,7 @@ impl From<&VaultItem> for ConfigItem {
             is_locked: v.is_locked,
             item_type: v.item_type,
             is_folder_hidden: v.is_folder_hidden,
+            size: v.size,
         }
     }
 }
@@ -91,6 +96,7 @@ impl From<&ConfigItem> for VaultItem {
             is_locked: c.is_locked,
             item_type: c.item_type,
             is_folder_hidden: c.is_folder_hidden,
+            size: c.size,
         }
     }
 }

@@ -14,8 +14,18 @@ use model::{ItemType, VaultItem};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::{VecDeque, HashSet, BTreeMap};
 use std::time::{Instant, SystemTime};
+
+/// Name of the primary modifier key, for hover hints. egui maps `Modifiers::command`
+/// to Cmd on macOS and Ctrl elsewhere, so the shortcuts themselves are already
+/// portable - only the label has to change.
+#[cfg(target_os = "macos")]
+const CMD_LABEL: &str = "Cmd";
+#[cfg(not(target_os = "macos"))]
+const CMD_LABEL: &str = "Ctrl";
 
 fn main() -> eframe::Result<()> {
     let mut options = eframe::NativeOptions::default();
@@ -26,8 +36,60 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "My Vault App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyVaultApp::new()))),
+        Box::new(|cc| {
+            install_unicode_font(&cc.egui_ctx);
+            Ok(Box::new(MyVaultApp::new()))
+        }),
     )
+}
+
+/// Add a system font that covers Thai to the font stack.
+///
+/// egui ships only Latin/Greek/Cyrillic faces, so a file named in Thai renders as a
+/// row of tofu boxes. There is no bundled font in this repo, so we look for one the
+/// OS already provides and append it as a *fallback* - the default face still wins
+/// for Latin text, and Thai codepoints fall through to this one.
+///
+/// If nothing is found the app keeps working exactly as before; this is a
+/// best-effort enhancement, never a startup failure.
+fn install_unicode_font(ctx: &egui::Context) {
+    // Ordered best-first per platform. `.ttc` collections are fine: `FontData`
+    // carries a face `index`, and 0 is the regular face in all of these.
+    const CANDIDATES: &[&str] = &[
+        // macOS
+        "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+        "/System/Library/Fonts/ThonburiUI.ttc",
+        "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+        // Windows
+        "C:\\Windows\\Fonts\\leelawui.ttf",
+        "C:\\Windows\\Fonts\\tahoma.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/TTF/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/truetype/tlwg/Loma.ttf",
+    ];
+
+    let Some(bytes) = CANDIDATES
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+    else {
+        return;
+    };
+
+    const KEY: &str = "system_unicode";
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(KEY.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+
+    // Append, never prepend: the default face keeps rendering Latin text, and only
+    // glyphs it does not have (Thai) fall through to the system font.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push(KEY.to_owned());
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 /// Create a simple vault icon (lock symbol in pixels)
@@ -97,7 +159,7 @@ struct MyVaultApp {
     wrapped_dek: Option<String>,
     confirm_action: Option<ConfirmAction>,
     current_op: Option<BatchOp>,
-    op_result_rxs: Vec<Receiver<(PathBuf, bool, Option<String>)>>,  // Multiple background thread receivers for parallel processing (path, success, optional_error_msg)
+    op_result_rxs: Vec<Receiver<(PathBuf, WorkerOutcome)>>,  // One receiver per in-flight worker thread
     show_error_report: bool,
     last_error_report: Vec<(PathBuf, String)>,
     perf_config: PerformanceConfig,  // Dynamic performance configuration based on CPU cores
@@ -265,6 +327,14 @@ impl MyVaultApp {
                 self.wrapped_dek = cfg.wrapped_dek;
                 self.items = cfg.vault_items.iter().map(|c| c.into()).collect();
 
+                // Configs written before sizes were cached have none. Measure them
+                // once here rather than in the paint loop; from now on they persist.
+                for item in &mut self.items {
+                    if item.size.is_none() {
+                        item.size = measure_size(&item.original_path);
+                    }
+                }
+
                 // Phase 2 & 3: Restore UI preferences
                 self.dark_mode = cfg.dark_mode;
                 self.sort_by = match cfg.sort_by.as_str() {
@@ -405,6 +475,7 @@ impl MyVaultApp {
 
     fn add_path(&mut self, path: PathBuf, item_type: ItemType) {
         let item = VaultItem {
+            size: measure_size(&path),
             original_path: path,
             encrypted_path: None,
             is_locked: false,
@@ -427,15 +498,69 @@ impl MyVaultApp {
         let mut indices: Vec<_> = self.selected.iter().copied().collect();
         indices.sort_by(|a, b| b.cmp(a));  // Sort descending
 
+        // Count before clearing the selection - reading the length afterwards
+        // always reported zero.
+        let mut removed = 0;
         for i in indices {
             if i < self.items.len() {
                 self.items.remove(i);
+                removed += 1;
             }
         }
 
         self.selected.clear();
-        self.status_message = format!("Removed {} items", self.selected.len());
+        self.last_selected = None;
+        self.status_message = format!("Removed {} items", removed);
         self.save_config();
+    }
+
+    /// Does this item survive the current search box?
+    fn matches_filter(&self, item: &VaultItem) -> bool {
+        path_matches_filter(&item.original_path, &self.search_filter)
+    }
+
+    /// Indices of the items the user can actually see right now.
+    ///
+    /// Select-all and every bulk action work from this, never from the whole list:
+    /// acting on rows hidden behind a search filter is how you encrypt a file you
+    /// did not know was selected.
+    fn visible_indices(&self) -> Vec<usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| self.matches_filter(item))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Paths of the current selection, in list order, for confirmation prompts.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let mut indices: Vec<usize> = self.selected.iter().copied().collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|i| self.items.get(i).map(|it| it.original_path.clone()))
+            .collect()
+    }
+
+    /// Re-measure the items a finished operation touched.
+    ///
+    /// A failed measurement keeps the previous value: after a lock the original file
+    /// is gone, and showing the size it had is far more useful than "N/A".
+    fn refresh_sizes(&mut self, indices: &[usize]) {
+        for &idx in indices {
+            if let Some(item) = self.items.get_mut(idx) {
+                let probe = item
+                    .encrypted_path
+                    .as_ref()
+                    .filter(|_| item.is_locked)
+                    .map(|p| p.as_path())
+                    .unwrap_or(item.original_path.as_path());
+                if let Some(size) = measure_size(probe) {
+                    item.size = Some(size);
+                }
+            }
+        }
     }
 
     fn scan_locked_files(&mut self, folder: &Path) {
@@ -472,13 +597,15 @@ impl MyVaultApp {
                     if already_added {
                         skipped_count += 1;
                     } else {
-                        // Add as locked file
+                        // Add as locked file. The original is gone, so the closest
+                        // thing to a size we can show is the ciphertext's.
                         let item = VaultItem {
                             original_path: original,
                             encrypted_path: Some(file_path.to_path_buf()),
                             is_locked: true,
                             item_type: ItemType::File,
                             is_folder_hidden: false,
+                            size: measure_size(file_path),
                         };
                         self.items.push(item);
                         found_count += 1;
@@ -600,6 +727,7 @@ impl MyVaultApp {
         // Start batch operation with all collected files
         self.current_op = Some(BatchOp {
             kind: BatchOpKind::LockFolder,
+            total: all_files.len(),
             queue: all_files,
             rx: None,
             scanning_done: true,
@@ -609,6 +737,8 @@ impl MyVaultApp {
             affected_items: selected_indices.clone(),
             error_details: Vec::new(),
             start_time: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            canceling: false,
         });
 
         let file_count = self.current_op.as_ref().unwrap().queue.len();
@@ -682,6 +812,7 @@ impl MyVaultApp {
         // Start batch operation with all collected encrypted files
         self.current_op = Some(BatchOp {
             kind: BatchOpKind::UnlockFolder,
+            total: all_files.len(),
             queue: all_files,
             rx: None,
             scanning_done: true,
@@ -691,6 +822,8 @@ impl MyVaultApp {
             affected_items: selected_indices.clone(),
             error_details: Vec::new(),
             start_time: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            canceling: false,
         });
 
         let file_count = self.current_op.as_ref().unwrap().queue.len();
@@ -839,19 +972,25 @@ impl eframe::App for MyVaultApp {
         }
 
         // Phase 2: Keyboard shortcuts
+        // `modifiers.command` is Cmd on macOS and Ctrl everywhere else. Matching on
+        // `.ctrl` meant none of these shortcuts fired in the macOS build.
         let busy = self.current_op.is_some();
         if !busy && self.authenticated && !self.show_password_dialog && !self.show_change_password_dialog {
+            // Computed outside the input closure: `visible_indices` borrows self.
+            let visible = self.visible_indices();
             ctx.input(|i| {
-                // Ctrl+A: Select all
-                if i.modifiers.ctrl && i.key_pressed(egui::Key::A) {
+                // Cmd/Ctrl+A: Select every *visible* row. Selecting rows hidden by
+                // the search filter would let a later Lock encrypt files the user
+                // never saw.
+                if i.modifiers.command && i.key_pressed(egui::Key::A) {
                     self.selected.clear();
-                    for idx in 0..self.items.len() {
-                        self.selected.insert(idx);
+                    for idx in &visible {
+                        self.selected.insert(*idx);
                     }
                 }
 
-                // Ctrl+L: Lock selected files
-                if i.modifiers.ctrl && i.key_pressed(egui::Key::L) {
+                // Cmd/Ctrl+L: Lock selected files
+                if i.modifiers.command && i.key_pressed(egui::Key::L) {
                     let has_selection = !self.selected.is_empty();
                     let some_selected_unlocked = self.selected.iter()
                         .any(|&idx| self.items.get(idx).map(|it| !it.is_locked).unwrap_or(false));
@@ -860,8 +999,8 @@ impl eframe::App for MyVaultApp {
                     }
                 }
 
-                // Ctrl+U: Unlock selected files
-                if i.modifiers.ctrl && i.key_pressed(egui::Key::U) {
+                // Cmd/Ctrl+U: Unlock selected files
+                if i.modifiers.command && i.key_pressed(egui::Key::U) {
                     let has_selection = !self.selected.is_empty();
                     let all_selected_locked = !self.selected.is_empty() &&
                         self.selected.iter().all(|&idx| self.items.get(idx).map(|it| it.is_locked).unwrap_or(false));
@@ -912,15 +1051,21 @@ impl eframe::App for MyVaultApp {
 
             self.op_result_rxs.retain_mut(|rx| {
                 match rx.try_recv() {
-                    Ok((path, success, error_msg)) => {
-                        if success {
-                            // Phase 3: Store path for later addition to recent files
-                            successful_paths.push(path);
-                        } else {
-                            op.failures += 1;
-                            if let Some(err) = error_msg {
+                    Ok((path, outcome)) => {
+                        match outcome {
+                            WorkerOutcome::Done => {
+                                op.processed += 1;
+                                // Phase 3: Store path for later addition to recent files
+                                successful_paths.push(path);
+                            }
+                            WorkerOutcome::Failed(err) => {
+                                op.processed += 1;
+                                op.failures += 1;
                                 op.error_details.push((path, err));
                             }
+                            // Cancelled before it touched anything: nothing happened
+                            // to this file, so it is neither done nor failed.
+                            WorkerOutcome::Skipped => {}
                         }
                         false  // Remove this receiver - operation completed
                     }
@@ -957,8 +1102,17 @@ impl eframe::App for MyVaultApp {
                 let (result_tx, result_rx) = mpsc::channel();
                 let op_kind = op.kind;
                 let p_clone = p.clone();
+                let cancel = Arc::clone(&op.cancel);
                 let _perf_config = self.perf_config.clone();  // Reserved for future adaptive performance tuning
                 std::thread::spawn(move || {
+                    // Last chance to back out. Once encryption starts we let it
+                    // finish: aborting mid-file would leave a truncated ciphertext
+                    // next to a deleted original.
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = result_tx.send((p_clone, WorkerOutcome::Skipped));
+                        return;
+                    }
+
                     let res = match op_kind {
                         BatchOpKind::LockFolder => {
                             let out = MyVaultApp::encrypted_path_for(&p);
@@ -968,8 +1122,10 @@ impl eframe::App for MyVaultApp {
                             if out.exists() {
                                 let _ = result_tx.send((
                                     p_clone,
-                                    false,
-                                    Some(format!("Encrypted file already exists: {}", out.display())),
+                                    WorkerOutcome::Failed(format!(
+                                        "Encrypted file already exists: {}",
+                                        out.display()
+                                    )),
                                 ));
                                 return;
                             }
@@ -988,9 +1144,9 @@ impl eframe::App for MyVaultApp {
                                 Ok(_) => {
                                     let _ = crate::platform::hide_encrypted_file(&out);
                                     let _ = std::fs::remove_file(&p);
-                                    (true, None)
+                                    WorkerOutcome::Done
                                 }
-                                Err(e) => (false, Some(format!("Encryption failed: {}", e))),
+                                Err(e) => WorkerOutcome::Failed(format!("Encryption failed: {}", e)),
                             }
                         }
                         BatchOpKind::UnlockFolder => {
@@ -998,7 +1154,7 @@ impl eframe::App for MyVaultApp {
                             if let Some(out) = MyVaultApp::original_path_for(&p) {
                                 // Check if original file already exists
                                 if out.exists() {
-                                    (false, Some(format!("Original file exists: {}", out.display())))
+                                    WorkerOutcome::Failed(format!("Original file exists: {}", out.display()))
                                 } else {
                                     // Use streaming decryption for all files to prevent memory exhaustion
                                     // when processing many files in parallel. Streaming is memory-safe and
@@ -1010,40 +1166,47 @@ impl eframe::App for MyVaultApp {
                                             // Force file handle cleanup
                                             drop(decrypt_result);
                                             let _ = std::fs::remove_file(&p);
-                                            (true, None)
+                                            WorkerOutcome::Done
                                         }
-                                        Err(e) => (false, Some(format!("Decryption failed: {}", e))),
+                                        Err(e) => WorkerOutcome::Failed(format!("Decryption failed: {}", e)),
                                     }
                                 }
                             } else {
-                                (false, Some("Invalid encrypted filename".to_string()))
+                                WorkerOutcome::Failed("Invalid encrypted filename".to_string())
                             }
                         }
                     };
-                    let _ = result_tx.send((p_clone, res.0, res.1));
+                    let _ = result_tx.send((p_clone, res));
                 });
 
                 // No artificial delay here: the number of in-flight workers is already
                 // bounded by `max_parallel` (<= 4), so file descriptors cannot pile up.
                 // Sleeping on the UI thread would freeze the interface for each spawn.
-                op.processed += 1;
                 self.op_result_rxs.push(result_rx);
             }
 
             // Complete only when scanning is done, queue is empty, AND all background threads finished
             if op.scanning_done && op.queue.is_empty() && self.op_result_rxs.is_empty() {
-                // Update all affected items (not just the first one)
-                for &idx in &op.affected_items {
-                    if let Some(item) = self.items.get_mut(idx) {
-                        match op.kind {
-                            BatchOpKind::LockFolder => item.is_locked = true,
-                            BatchOpKind::UnlockFolder => item.is_locked = false,
+                // A cancelled run stopped part-way through, so the items it covers are
+                // in a mixed state - claiming they are all locked (or all unlocked)
+                // would be a lie. Leave the flags alone and say so in the status bar.
+                if !op.canceling {
+                    // Update all affected items (not just the first one)
+                    for &idx in &op.affected_items {
+                        if let Some(item) = self.items.get_mut(idx) {
+                            match op.kind {
+                                BatchOpKind::LockFolder => item.is_locked = true,
+                                BatchOpKind::UnlockFolder => item.is_locked = false,
+                            }
                         }
                     }
                 }
 
+                let affected = op.affected_items.clone();
+                self.refresh_sizes(&affected);
+
                 // Hide folders after successful lock
-                if matches!(op.kind, BatchOpKind::LockFolder) {
+                if matches!(op.kind, BatchOpKind::LockFolder) && !op.canceling {
                     let folder_indices: Vec<usize> = op.affected_items.iter()
                         .filter(|&&idx| {
                             self.items.get(idx)
@@ -1089,7 +1252,16 @@ impl eframe::App for MyVaultApp {
                     format!("{}m {:.1}s", mins as u32, secs)
                 };
 
-                let msg = match op.kind {
+                let msg = if op.canceling {
+                    let verb = match op.kind {
+                        BatchOpKind::LockFolder => "lock",
+                        BatchOpKind::UnlockFolder => "unlock",
+                    };
+                    format!(
+                        "Canceled {} after {} of {} files ({} errors) in {} - the remaining files were left untouched, run it again to finish",
+                        verb, op.processed, op.total, op.failures, time_str
+                    )
+                } else { match op.kind {
                     BatchOpKind::LockFolder => {
                         let folder_count = op.affected_items.iter()
                             .filter(|&&idx| {
@@ -1130,7 +1302,7 @@ impl eframe::App for MyVaultApp {
                             format!("Unlocked {} items with {} errors in {} - click 'View Error Report' to see details", op.affected_items.len(), op.failures, time_str)
                         }
                     }
-                };
+                } };
                 self.status_message = msg;
                 // completed
             } else {
@@ -1285,14 +1457,14 @@ impl eframe::App for MyVaultApp {
 
                 let can_lock = !busy && has_selection && self.authenticated && some_selected_unlocked;
                 if ui.add_enabled(can_lock, egui::Button::new("Lock"))
-                    .on_hover_text("Encrypt selected files (Ctrl+L)")
+                    .on_hover_text(format!("Encrypt selected files ({}+L)", CMD_LABEL))
                     .clicked() {
                     self.confirm_action = Some(ConfirmAction::Lock);
                 }
 
                 let can_unlock = !busy && has_selection && self.authenticated && all_selected_locked;
                 if ui.add_enabled(can_unlock, egui::Button::new("Unlock"))
-                    .on_hover_text("Decrypt selected files (Ctrl+U)")
+                    .on_hover_text(format!("Decrypt selected files ({}+U)", CMD_LABEL))
                     .clicked() {
                     self.confirm_action = Some(ConfirmAction::Unlock);
                 }
@@ -1383,20 +1555,15 @@ impl eframe::App for MyVaultApp {
 
             // Phase 2: Prepare filtered and sorted items
             let mut display_items: Vec<(usize, &VaultItem)> = self.items.iter().enumerate()
-                .filter(|(_, item)| {
-                    // Filter by search string
-                    if self.search_filter.is_empty() {
-                        true
-                    } else {
-                        let search_lower = self.search_filter.to_lowercase();
-                        item.original_path.to_string_lossy().to_lowercase().contains(&search_lower)
-                    }
-                })
+                .filter(|(_, item)| self.matches_filter(item))
                 .collect();
 
-            // Sort items
-            display_items.sort_by(|(_, a), (_, b)| {
-                let ordering = match self.sort_by {
+            // Sort items. Sizes come from the per-item cache: comparing them used to
+            // stat both operands, so a single repaint issued O(n log n) syscalls.
+            let sort_by = self.sort_by;
+            let sort_ascending = self.sort_ascending;
+            let compare = move |a: &VaultItem, b: &VaultItem| {
+                let ordering = match sort_by {
                     SortField::Name => {
                         a.original_path.file_name().unwrap_or_default()
                             .to_string_lossy()
@@ -1406,19 +1573,19 @@ impl eframe::App for MyVaultApp {
                         a.is_locked.cmp(&b.is_locked)
                     }
                     SortField::Size => {
-                        let size_a = std::fs::metadata(&a.original_path).map(|m| m.len()).unwrap_or(0);
-                        let size_b = std::fs::metadata(&b.original_path).map(|m| m.len()).unwrap_or(0);
-                        size_a.cmp(&size_b)
+                        a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0))
                     }
                 };
-                if self.sort_ascending {
+                if sort_ascending {
                     ordering
                 } else {
                     ordering.reverse()
                 }
-            });
+            };
+            display_items.sort_by(|(_, a), (_, b)| compare(a, b));
 
-            // Group items by parent directory
+            // Group items by parent directory. The sort above already fixed the order
+            // within each group, so there is no second per-group sort here.
             let mut groups: BTreeMap<PathBuf, Vec<(usize, &VaultItem)>> = BTreeMap::new();
             for item in &display_items {
                 let parent = item.1.original_path.parent()
@@ -1427,31 +1594,14 @@ impl eframe::App for MyVaultApp {
                 groups.entry(parent).or_default().push(*item);
             }
 
-            // Sort files within each folder group
-            for (_, items) in groups.iter_mut() {
-                items.sort_by(|(_, a), (_, b)| {
-                    let ordering = match self.sort_by {
-                        SortField::Name => {
-                            a.original_path.file_name().unwrap_or_default()
-                                .to_string_lossy()
-                                .cmp(&b.original_path.file_name().unwrap_or_default().to_string_lossy())
-                        }
-                        SortField::Status => {
-                            a.is_locked.cmp(&b.is_locked)
-                        }
-                        SortField::Size => {
-                            let size_a = std::fs::metadata(&a.original_path).map(|m| m.len()).unwrap_or(0);
-                            let size_b = std::fs::metadata(&b.original_path).map(|m| m.len()).unwrap_or(0);
-                            size_a.cmp(&size_b)
-                        }
-                    };
-                    if self.sort_ascending {
-                        ordering
-                    } else {
-                        ordering.reverse()
-                    }
-                });
-            }
+            // The order rows actually appear in on screen. Shift+click ranges are
+            // resolved against this, not against `items` indices - those are insertion
+            // order, so a shift-selection used to grab a completely different set of
+            // files than the ones highlighted between the two clicks.
+            let visual_order: Vec<usize> = groups
+                .values()
+                .flat_map(|items| items.iter().map(|(idx, _)| *idx))
+                .collect();
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
@@ -1492,7 +1642,7 @@ impl eframe::App for MyVaultApp {
                             let file_name = item.original_path.file_name()
                                 .unwrap_or_default()
                                 .to_string_lossy();
-                            let file_size = format_file_size(&item.original_path);
+                            let file_size = format_file_size(item.size);
                             let label = format!(
                                 "     {}  {}  {}  {} {}",
                                 match item.item_type { ItemType::File => "└", ItemType::Folder => "📁" },
@@ -1513,18 +1663,14 @@ impl eframe::App for MyVaultApp {
                             if ui.selectable_label(is_selected, label_text).clicked() {
                                 let modifiers = ui.ctx().input(|i| i.modifiers);
                                 if modifiers.shift {
-                                    // Range select with Shift held
-                                    if let Some(last) = self.last_selected {
-                                        let start = last.min(*idx);
-                                        let end = last.max(*idx);
-                                        for j in start..=end {
-                                            self.selected.insert(j);
-                                        }
-                                    } else {
-                                        self.selected.insert(*idx);
+                                    // Range select with Shift held, walking the rows as
+                                    // they are drawn so the selection matches what the
+                                    // user sees highlighted.
+                                    for v in shift_range(&visual_order, self.last_selected, *idx) {
+                                        self.selected.insert(v);
                                     }
                                     self.last_selected = Some(*idx);
-                                } else if modifiers.ctrl {
+                                } else if modifiers.command {
                                     // Toggle with Ctrl held
                                     if is_selected {
                                         self.selected.remove(idx);
@@ -2069,30 +2215,55 @@ impl eframe::App for MyVaultApp {
                                 });
                             }
                             _ => {
-                                let item_desc = if let Some(&i) = self.selected.iter().next() {
-                                    self.items.get(i)
-                                        .map(|it| format!("{}", it.original_path.display()))
-                                        .unwrap_or_else(|| "<none>".to_string())
-                                } else {
-                                    "<none>".to_string()
-                                };
+                                // Every one of these acts on the WHOLE selection. The
+                                // dialog used to name a single arbitrary item pulled
+                                // out of a HashSet, so confirming a 50-file lock looked
+                                // like confirming one file - while the originals of all
+                                // 50 were deleted.
+                                let paths = self.selected_paths();
+                                let count = paths.len();
+                                let noun = if count == 1 { "item" } else { "items" };
+
                                 match action {
-                                    ConfirmAction::Lock => ui.label("This will encrypt and hide the selected item."),
-                                    ConfirmAction::Unlock => ui.label("This will decrypt and restore the selected item."),
-                                    ConfirmAction::Remove => ui.label("This removes the item from the list only; it does not delete files."),
+                                    ConfirmAction::Lock => {
+                                        ui.label(format!("Encrypt {} selected {}.", count, noun));
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 90, 40),
+                                            "⚠ The original files are deleted once they are encrypted. Folders are hidden as well.",
+                                        );
+                                    }
+                                    ConfirmAction::Unlock => {
+                                        ui.label(format!("Decrypt {} selected {}.", count, noun));
+                                        ui.label("The encrypted copies are removed once the originals are restored.");
+                                    }
+                                    ConfirmAction::Remove => {
+                                        ui.label(format!("Remove {} selected {} from the list.", count, noun));
+                                        ui.label("Nothing on disk is deleted - encrypted files stay encrypted.");
+                                    }
                                     ConfirmAction::HideFolderWithFailures { .. } => unreachable!(),
-                                };
-                                ui.label(format!("Item: {}",
-                                    item_desc
-                                ));
+                                }
+
+                                ui.separator();
+
+                                // Name what is actually affected, capped so a big
+                                // selection cannot push the buttons off-screen.
+                                const PREVIEW: usize = 6;
+                                for path in paths.iter().take(PREVIEW) {
+                                    ui.label(format!("• {}", path.display()));
+                                }
+                                if count > PREVIEW {
+                                    ui.label(format!("...and {} more", count - PREVIEW));
+                                }
+
+                                ui.separator();
                                 ui.horizontal(|ui| {
                                     if ui.button("Cancel").clicked() {
                                         self.confirm_action = None;
                                     }
                                     let confirm_label = match action {
-                                        ConfirmAction::Lock => "Lock",
-                                        ConfirmAction::Unlock => "Unlock",
-                                        ConfirmAction::Remove => "Remove",
+                                        ConfirmAction::Lock => format!("Lock {} {}", count, noun),
+                                        ConfirmAction::Unlock => format!("Unlock {} {}", count, noun),
+                                        ConfirmAction::Remove => format!("Remove {} {}", count, noun),
                                         ConfirmAction::HideFolderWithFailures { .. } => unreachable!(),
                                     };
                                     if ui.button(confirm_label).clicked() {
@@ -2177,6 +2348,9 @@ impl eframe::App for MyVaultApp {
             let failures = op.failures;
             let kind = op.kind;
             let start_time = op.start_time;
+            let total = op.total;
+            let canceling = op.canceling;
+            let in_flight = self.op_result_rxs.len();
 
             // Phase 1: Calculate throughput and ETA
             let elapsed = start_time.elapsed().as_secs_f32();
@@ -2187,7 +2361,6 @@ impl eframe::App for MyVaultApp {
             };
 
             let (progress, text, eta_text) = if scanning_done {
-                let total = processed + queue_len;
                 let pct = if total == 0 { 0.0 } else { processed as f32 / total as f32 };
                 let eta = if throughput > 0.0 && queue_len > 0 {
                     let remaining_secs = queue_len as f32 / throughput;
@@ -2226,36 +2399,92 @@ impl eframe::App for MyVaultApp {
                     } else {
                         ui.add(egui::Spinner::new());
                     }
-                    if ui.button("Cancel").clicked() {
+
+                    if canceling {
+                        // Be honest about what cancelling can and cannot do: the files
+                        // already being encrypted have to finish, or they would be left
+                        // truncated.
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 170, 60),
+                                format!(
+                                    "Canceling - finishing {} file(s) already in progress...",
+                                    in_flight
+                                ),
+                            );
+                        });
+                        ui.label(format!("{} file(s) will be skipped.", queue_len));
+                    } else if ui.button("Cancel").clicked() {
                         cancel_clicked = true;
                     }
                 });
             if cancel_clicked {
-                self.status_message = match kind {
-                    BatchOpKind::LockFolder => format!("Canceled lock; processed {} files", processed),
-                    BatchOpKind::UnlockFolder => format!("Canceled unlock; processed {} files", processed),
-                };
-                self.current_op = None;
+                // Cancelling used to just drop the operation. The worker threads kept
+                // encrypting and deleting files in the background, and their receivers
+                // stayed in `op_result_rxs`, so the *next* operation inherited them and
+                // reported nonsense. Instead: stop dispatching, let the in-flight
+                // workers report back, and finish through the normal completion path.
+                if let Some(op) = self.current_op.as_mut() {
+                    op.cancel.store(true, Ordering::Relaxed);
+                    op.canceling = true;
+                    op.queue.clear();
+                }
+                ctx.request_repaint();
             }
         }
     }
 }
 
-/// Phase 2: Get file size with human-readable format
-fn format_file_size(path: &Path) -> String {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let size = metadata.len();
-        if size < 1024 {
-            format!("{} B", size)
-        } else if size < 1024 * 1024 {
-            format!("{:.1} KB", size as f64 / 1024.0)
-        } else if size < 1024 * 1024 * 1024 {
-            format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
-        } else {
-            format!("{:.2} GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
-        }
+/// Case-insensitive substring match of a path against the search box.
+/// An empty filter matches everything.
+fn path_matches_filter(path: &Path, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    path.to_string_lossy()
+        .to_lowercase()
+        .contains(&filter.to_lowercase())
+}
+
+/// Resolve a Shift+click into the rows between the anchor and the clicked row,
+/// **in on-screen order**.
+///
+/// `visual_order` is the sequence of item indices as they are painted (filtered,
+/// sorted, grouped by folder). Ranging over raw item indices instead selects
+/// whatever happens to sit between them in insertion order - a different set of
+/// files than the ones highlighted on screen.
+///
+/// If either end is not currently visible, only the clicked row is selected.
+fn shift_range(visual_order: &[usize], anchor: Option<usize>, clicked: usize) -> Vec<usize> {
+    let anchor_pos = anchor.and_then(|a| visual_order.iter().position(|v| *v == a));
+    let clicked_pos = visual_order.iter().position(|v| *v == clicked);
+
+    match (anchor_pos, clicked_pos) {
+        (Some(a), Some(c)) => visual_order[a.min(c)..=a.max(c)].to_vec(),
+        _ => vec![clicked],
+    }
+}
+
+/// Read a path's size on disk. The only place that touches the filesystem for
+/// sizes - callers cache the result on the item, never re-measure while painting.
+fn measure_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Phase 2: Render a cached size in human-readable form.
+fn format_file_size(size: Option<u64>) -> String {
+    let Some(size) = size else {
+        return "N/A".to_string();
+    };
+    if size < 1024 {
+        format!("{} B", size)
+    } else if size < 1024 * 1024 {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    } else if size < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
     } else {
-        "N/A".to_string()
+        format!("{:.2} GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
@@ -2314,12 +2543,30 @@ struct BatchOp {
     queue: VecDeque<PathBuf>,
     rx: Option<Receiver<PathBuf>>,
     scanning_done: bool,
-    processed: usize,
+    /// Files this operation set out to process, fixed when it starts. Progress is
+    /// measured against this rather than against dispatched-so-far, which counted
+    /// files that had only been handed to a worker.
+    total: usize,
+    processed: usize,   // Files that finished, successfully or not
     failures: usize,
     _item_index: usize,  // Reserved for future use
     affected_items: Vec<usize>,  // All item indices involved in this batch operation
     error_details: Vec<(PathBuf, String)>,  // Detailed error tracking: (file_path, error_reason)
     start_time: Instant,  // Track operation start time
+    /// Set by the Cancel button. Workers that have not started yet see it and bail
+    /// out; ones already encrypting a file run to completion so no file is left
+    /// half-written.
+    cancel: Arc<AtomicBool>,
+    canceling: bool,
+}
+
+/// What a worker thread did with one file.
+#[derive(Debug)]
+enum WorkerOutcome {
+    Done,
+    Failed(String),
+    /// Cancelled before any work started - not a failure, and not progress either.
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2429,6 +2676,63 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         // Undoing something that never happened is still fine.
         assert!(crate::platform::unhide(&dir).is_ok());
+    }
+
+    /// Shift+click must follow what is on screen. The list is filtered, sorted and
+    /// grouped by folder, so the painted order has nothing to do with the order
+    /// items were added in - which is what the raw indices encode.
+    #[test]
+    fn test_shift_range_follows_visual_order_not_item_indices() {
+        // Rows are painted as items 4, 0, 2 - e.g. after sorting by name.
+        let order = vec![4, 0, 2];
+
+        // Anchor on the first row, click the last: everything drawn between them.
+        assert_eq!(shift_range(&order, Some(4), 2), vec![4, 0, 2]);
+
+        // Dragging upwards selects the same rows.
+        assert_eq!(shift_range(&order, Some(2), 4), vec![4, 0, 2]);
+
+        // A range that stops early must not sweep in item 1 or 3, which sit
+        // between 0 and 2 numerically but are not on screen at all.
+        assert_eq!(shift_range(&order, Some(0), 2), vec![0, 2]);
+    }
+
+    #[test]
+    fn test_shift_range_without_anchor_selects_only_the_clicked_row() {
+        let order = vec![4, 0, 2];
+        assert_eq!(shift_range(&order, None, 0), vec![0]);
+    }
+
+    /// If the anchor was filtered out of the list since it was clicked, there is no
+    /// meaningful range - selecting from a row the user can no longer see would
+    /// silently pull in files that are not displayed.
+    #[test]
+    fn test_shift_range_ignores_anchor_that_is_no_longer_visible() {
+        let order = vec![4, 0, 2];
+        assert_eq!(shift_range(&order, Some(7), 0), vec![0]);
+    }
+
+    /// The search box scopes bulk actions. If this predicate ever matched more than
+    /// what is drawn, Select All would hand hidden files to Lock.
+    #[test]
+    fn test_path_filter_is_case_insensitive_and_empty_matches_all() {
+        let path = Path::new("/tmp/vault/Quarterly Report.pdf");
+
+        assert!(path_matches_filter(path, ""), "An empty filter shows everything");
+        assert!(path_matches_filter(path, "quarterly"), "Matching ignores case");
+        assert!(path_matches_filter(path, "REPORT"), "Matching ignores case");
+        assert!(path_matches_filter(path, "/tmp/vault"), "The directory is searchable too");
+        assert!(!path_matches_filter(path, "invoice"), "Non-matching paths stay hidden");
+    }
+
+    #[test]
+    fn test_format_file_size_reports_unmeasured_items_as_na() {
+        assert_eq!(format_file_size(None), "N/A");
+        assert_eq!(format_file_size(Some(0)), "0 B");
+        assert_eq!(format_file_size(Some(512)), "512 B");
+        assert_eq!(format_file_size(Some(2048)), "2.0 KB");
+        assert_eq!(format_file_size(Some(5 * 1024 * 1024)), "5.0 MB");
+        assert_eq!(format_file_size(Some(3 * 1024 * 1024 * 1024)), "3.00 GB");
     }
 
     #[test]
